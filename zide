@@ -14,6 +14,11 @@
 #   * Every generated JSON file is validated with jq (when installed) before write.
 #   * Output is deterministic: same inputs => byte-identical files.
 #
+# Single-quoted literals below are generated file content (Zed JSON values such as
+# $ZED_WORKTREE_ROOT, bash -c payloads, CMake variables), never shell expansions.
+# shellcheck disable=SC2016
+# tr ranges are ASCII-only on purpose: derived identifiers are ASCII by construction.
+# shellcheck disable=SC2018,SC2019
 set -Eeuo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
