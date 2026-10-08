@@ -24,7 +24,20 @@ jobs:
       - name: Install toolchain
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake ninja-build gcc g++ git jq make curl ca-certificates cargo rustc
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc g++ git jq make curl ca-certificates cargo rustc python3-pip
+          pip3 install -q "cmake==3.28.*" ninja
+      - name: Verify CMake floor (>= 3.21)
+        run: |
+          cmake --version
+          ver=$(cmake --version | head -n1 | grep -Eo '[0-9]+\.[0-9]+' | head -n1)
+          major=${ver%%.*}
+          minor=${ver#*.}
+          if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 21 ]; }; then
+            echo "cmake $ver >= 3.21 floor OK"
+          else
+            echo "cmake $ver is below the 3.21 floor — failing the job"
+            exit 1
+          fi
       - run: make test-compat
         env:
           ZIDE_REQUIRE_PTY: "1"
