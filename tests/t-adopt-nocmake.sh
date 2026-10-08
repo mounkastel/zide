@@ -18,9 +18,23 @@ if grep -q "add_executable" "$T/bare/CMakeLists.txt"; then tap_ok "CMakeLists.tx
 
 mkdir -p -- "$T/bare2"
 printf 'int main(void) { return 0; }\n' >"$T/bare2/main.c"
-"$ZIDE" adopt "$T/bare2" --no-configure --no-cmake >/dev/null 2>&1
+if ! "$ZIDE" adopt "$T/bare2" --no-configure --no-cmake >/dev/null 2>&1; then
+  tap_not_ok "adopt --no-cmake exits 0"
+  exit 1
+fi
+tap_ok "adopt --no-cmake exits 0"
 if [[ ! -e $T/bare2/CMakeLists.txt ]]; then
   tap_ok "--no-cmake skips CMakeLists generation"
 else
   tap_not_ok "--no-cmake skips CMakeLists generation"
+fi
+
+# Filenames with newlines must not corrupt detection.
+mkdir -p -- "$T/weird"
+printf 'int odd(void) { return 1; }\n' >"$T/weird/odd.c"
+touch "$T/weird/$(printf 'we\nird.c')"
+if "$ZIDE" adopt "$T/weird" --no-configure --no-cmake >/dev/null 2>&1; then
+  tap_ok "newline in filename tolerated"
+else
+  tap_not_ok "newline in filename tolerated"
 fi

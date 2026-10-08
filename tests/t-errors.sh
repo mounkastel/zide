@@ -33,6 +33,10 @@ if ((rc == 4)); then tap_ok "adopt / exits 4 (refused)"; else tap_not_ok "adopt 
 rc=$?
 if ((rc == 4)); then tap_ok "init \$HOME exits 4 (refused)"; else tap_not_ok "init \$HOME exits 4 (refused)"; fi
 
+"$ZIDE" init /usr/zide-probe-nonexistent --lang cpp -y --no-git >/dev/null 2>&1
+rc=$?
+if ((rc == 4)); then tap_ok "init under /usr exits 4 (refused)"; else tap_not_ok "init under /usr exits 4 (refused)"; fi
+
 "$ZIDE" doctor >/dev/null 2>&1
 rc=$?
 if ((rc == 0 || rc == 1)); then tap_ok "doctor exits 0/1"; else tap_not_ok "doctor exits 0/1 (got $rc)"; fi

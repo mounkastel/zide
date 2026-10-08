@@ -42,3 +42,16 @@ if [[ -L $P/compile_commands.json ]]; then
 else
   tap_not_ok "compile_commands.json symlinked after configure"
 fi
+
+# An absolute compile_commands.json symlink must not confuse build-dir reuse.
+T2=$(fresh_dir)
+track_tmp "$T2"
+mkdir -p -- "$T2/abs/src"
+cp "$P/CMakeLists.txt" "$T2/abs/CMakeLists.txt"
+cp "$P/src/main.cpp" "$T2/abs/src/main.cpp"
+ln -s /nonexistent-elsewhere/compile_commands.json "$T2/abs/compile_commands.json"
+if "$ZIDE" adopt "$T2/abs" --no-configure >/dev/null 2>&1; then
+  tap_ok "absolute compdb symlink tolerated"
+else
+  tap_not_ok "absolute compdb symlink tolerated"
+fi
