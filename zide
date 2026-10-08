@@ -1,0 +1,2448 @@
+#!/usr/bin/env bash
+#
+# zide - provision an IDE-grade Zed environment for native systems projects.
+#
+#   zide adopt <project-path>   retrofit an existing project (non-destructive)
+#   zide init  <project-path>   scaffold a new, building, testable project
+#   zide doctor                 report toolchain status with install hints
+#
+# Bash 5+, Linux. No network access at runtime. MIT licensed.
+#
+# Design rules
+#   * Nothing is overwritten without --force; replaced files get .bak.<UTC ts>.
+#   * Zed JSON files that already exist are MERGED (your keys win), never clobbered.
+#   * Every generated JSON file is validated with jq (when installed) before write.
+#   * Output is deterministic: same inputs => byte-identical files.
+#
+set -Eeuo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
+
+if ((BASH_VERSINFO[0] < 5)); then
+  printf 'zide: Bash 5+ is required (found %s)\n' "$BASH_VERSION" >&2
+  exit 2
+fi
+
+readonly ZIDE_VERSION="2.0.0"
+readonly PROG="zide"
+readonly E_USAGE=2 E_JSON=3 E_REFUSED=4
+
+DRY_RUN=0
+VERBOSE=0
+FORCE=0
+YES=0
+COLOR=auto
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+C_RESET="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_BOLD=""
+
+setup_colors() {
+  C_RESET="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_BOLD=""
+  if [[ $COLOR != never && -z ${NO_COLOR:-} && -t 2 ]]; then
+    C_RESET=$'\033[0m' C_DIM=$'\033[2m' C_RED=$'\033[31m' C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m' C_CYAN=$'\033[36m' C_BOLD=$'\033[1m'
+  fi
+}
+
+WARNINGS=()
+info() { printf '%s[info]%s %s\n' "$C_BLUE" "$C_RESET" "$*" >&2; }
+ok() { printf '%s[ ok ]%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn() {
+  WARNINGS+=("$*")
+  printf '%s[warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+err() { printf '%s[fail]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+dbg() {
+  if ((VERBOSE)); then printf '%s[dbug]%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; fi
+}
+dry() { printf '%s[dry ]%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
+die() {
+  local rc=$1
+  shift
+  err "$*"
+  exit "$rc"
+}
+
+TMPFILES=()
+TMP_LAST=""
+mk_tmp() {
+  TMP_LAST=$(mktemp "${TMPDIR:-/tmp}/zide.XXXXXX")
+  TMPFILES+=("$TMP_LAST")
+}
+
+cleanup() {
+  local f
+  if ((${INTERACTIVE:-0})); then printf '\033[?25h' >&2; fi
+  for f in "${TMPFILES[@]}"; do rm -rf -- "$f"; done
+}
+on_err() {
+  local rc=$?
+  # die() already reported deliberate failures (also when raised inside $(...)).
+  case $rc in "$E_USAGE" | "$E_JSON" | "$E_REFUSED") return 0 ;; esac
+  err "internal error (exit $rc) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+}
+trap on_err ERR
+trap cleanup EXIT
+trap 'err "interrupted"; exit 130' INT TERM
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------------------------------
+# Toolchain probing and per-distro install hints
+# --------------------------------------------------------------------------
+pkg_family() {
+  local id="" like=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    id=$(. /etc/os-release && printf '%s' "${ID:-}")
+    # shellcheck disable=SC1091
+    like=$(. /etc/os-release && printf '%s' "${ID_LIKE:-}")
+  fi
+  case " $id $like " in
+    *" debian "* | *" ubuntu "*) echo apt; return 0 ;;
+    *" fedora "* | *" rhel "* | *" centos "*) echo dnf; return 0 ;;
+    *" arch "*) echo pacman; return 0 ;;
+    *" suse "* | *opensuse* | *" sles "*) echo zypper; return 0 ;;
+  esac
+  local m
+  for m in apt-get:apt dnf:dnf pacman:pacman zypper:zypper; do
+    if have "${m%%:*}"; then echo "${m##*:}"; return 0; fi
+  done
+  echo unknown
+}
+
+install_hint() {
+  local tool=$1 fam pkg
+  fam=$(pkg_family)
+  case $tool in
+    cargo | rustc | rust-analyzer)
+      if [[ $tool == rust-analyzer ]]; then
+        echo "rustup component add rust-analyzer   (or your distro's rust-analyzer package)"
+      else
+        echo "install Rust via rustup (https://rustup.rs) or your distro's rust/cargo package"
+      fi
+      return 0
+      ;;
+    compdb | compiledb)
+      echo "pipx install $tool"
+      return 0
+      ;;
+  esac
+  case $fam:$tool in
+    apt:ninja | dnf:ninja) pkg=ninja-build ;;
+    pacman:ninja | zypper:ninja) pkg=ninja ;;
+    dnf:clangd | dnf:clang-format | dnf:clang-tidy) pkg=clang-tools-extra ;;
+    pacman:clangd | pacman:clang-format | pacman:clang-tidy) pkg=clang ;;
+    zypper:clangd | zypper:clang-format | zypper:clang-tidy) pkg=clang-tools ;;
+    *) pkg=$tool ;;
+  esac
+  case $fam in
+    apt) echo "sudo apt install $pkg" ;;
+    dnf) echo "sudo dnf install $pkg" ;;
+    pacman) echo "sudo pacman -S $pkg" ;;
+    zypper) echo "sudo zypper install $pkg" ;;
+    *) echo "install '$pkg' with your package manager" ;;
+  esac
+}
+
+tool_version() {
+  local out
+  if ! have "$1"; then
+    printf 'missing'
+    return 0
+  fi
+  out=$({ "$1" --version 2>&1 || true; } | sed -n '1p')
+  printf '%s' "${out:-unknown}"
+}
+
+# need_tool <tool> <required:0|1> <why>
+need_tool() {
+  local tool=$1 required=$2 why=${3:-}
+  if have "$tool"; then
+    dbg "$tool: $(tool_version "$tool")"
+    return 0
+  fi
+  if ((required)); then
+    warn "missing tool '$tool'${why:+ ($why)} -> $(install_hint "$tool")"
+  else
+    info "optional tool '$tool' not found${why:+ ($why)} -> $(install_hint "$tool")"
+  fi
+  return 0
+}
+
+print_toolchain() {
+  local t
+  for t in cmake ninja clangd clang-format clang-tidy git jq bear compiledb compdb meson gdb lldb cargo rustc rust-analyzer; do
+    printf '  %-14s %s\n' "$t" "$(tool_version "$t")"
+  done
+}
+
+cmd_doctor() {
+  printf '%szide %s toolchain report%s (distro family: %s)\n' "$C_BOLD" "$ZIDE_VERSION" "$C_RESET" "$(pkg_family)"
+  print_toolchain
+  local t
+  printf '\nInstall hints for missing tools:\n'
+  for t in cmake ninja clangd clang-format clang-tidy git jq bear gdb lldb cargo rust-analyzer; do
+    if ! have "$t"; then printf '  %-14s %s\n' "$t" "$(install_hint "$t")"; fi
+  done
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Safe filesystem primitives
+# --------------------------------------------------------------------------
+ROOT=""
+CREATED=() UPDATED=() UNCHANGED=() KEPT=() BACKUPS=()
+
+rel() { printf '%s' "${1#"$ROOT"/}"; }
+
+safe_path() {
+  local p=$1 abs
+  [[ -n $p ]] || die "$E_USAGE" "empty project path"
+  abs=$(realpath -m -- "$p")
+  case $abs in
+    / | /bin | /boot | /dev | /etc | /lib | /lib64 | /proc | /root | /run | /sbin | /sys | /usr | /var | "${HOME:-/nonexistent}")
+      die "$E_REFUSED" "refusing to operate on protected path: $abs"
+      ;;
+  esac
+  printf '%s' "$abs"
+}
+
+mk_dir() {
+  local d
+  for d in "$@"; do
+    if [[ -d $d ]]; then continue; fi
+    if ((DRY_RUN)); then dry "mkdir -p $(rel "$d")"; else mkdir -p -- "$d"; fi
+  done
+}
+
+backup_file() {
+  local path=$1 stamp b n=0
+  stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  b="${path}.bak.${stamp}"
+  while [[ -e $b || -L $b ]]; do
+    n=$((n + 1))
+    b="${path}.bak.${stamp}.${n}"
+  done
+  if ((DRY_RUN)); then
+    dry "backup $(rel "$path") -> $(rel "$b")"
+  else
+    cp -a -- "$path" "$b"
+    info "backup: $(rel "$path") -> $(rel "$b")"
+  fi
+  BACKUPS+=("$(rel "$b")")
+}
+
+# commit_file <src> <dest> <mode> <allow_modify:0|1>
+commit_file() {
+  local src=$1 dest=$2 mode=$3 allow=${4:-0} r
+  r=$(rel "$dest")
+  if [[ -e $dest || -L $dest ]]; then
+    if [[ -f $dest && ! -L $dest ]] && cmp -s -- "$src" "$dest"; then
+      UNCHANGED+=("$r")
+      dbg "unchanged: $r"
+      if [[ $mode == 755 && ! -x $dest ]] && ((!DRY_RUN)); then chmod 755 -- "$dest"; fi
+      return 0
+    fi
+    if ((!FORCE && !allow)); then
+      KEPT+=("$r")
+      info "kept your existing file (differs from template; --force replaces): $r"
+      return 0
+    fi
+    backup_file "$dest"
+    if ((DRY_RUN)); then dry "update $r"; else install -m "$mode" -- "$src" "$dest"; fi
+    UPDATED+=("$r")
+    return 0
+  fi
+  if ((DRY_RUN)); then
+    dry "create $r"
+  else
+    mkdir -p -- "$(dirname -- "$dest")"
+    install -m "$mode" -- "$src" "$dest"
+    dbg "created: $r"
+  fi
+  CREATED+=("$r")
+}
+
+validate_json() { # <file> <label>
+  if ! have jq; then return 0; fi
+  if ! jq -e . -- "$1" >/dev/null 2>&1; then
+    err "generated JSON is invalid: $2"
+    jq . -- "$1" 2>&1 | head -n 5 >&2 || true
+    exit "$E_JSON"
+  fi
+}
+
+# Merge helpers: <ours> <existing>; existing keys/entries always win.
+merge_object() { jq --indent 2 -s '.[0] * .[1]' -- "$1" "$2"; }
+merge_array() {
+  jq --indent 2 -s '.[1] as $e | $e + (.[0] | map(select(.label as $l | ($e | map(.label) | index($l)) | not)))' -- "$1" "$2"
+}
+
+# put_file <dest> <kind: text|json|json-object|json-array> <mode>   (content in $TMP_LAST)
+put_file() {
+  local dest=$1 kind=${2:-text} mode=${3:-644} merged
+  case $kind in json*) validate_json "$TMP_LAST" "$(rel "$dest")" ;; esac
+  if [[ $kind == json-* && -f $dest && ! -L $dest ]] && ((!FORCE)) && have jq && ! cmp -s -- "$TMP_LAST" "$dest"; then
+    if jq -e . -- "$dest" >/dev/null 2>&1; then
+      mk_tmp
+      merged=$TMP_LAST
+      if [[ $kind == json-object ]]; then
+        merge_object "$OURS" "$dest" >"$merged"
+      else
+        merge_array "$OURS" "$dest" >"$merged"
+      fi
+      if cmp -s <(jq -S . -- "$merged") <(jq -S . -- "$dest"); then
+        UNCHANGED+=("$(rel "$dest") (already contains zide entries)")
+        return 0
+      fi
+      commit_file "$merged" "$dest" "$mode" 1
+      return 0
+    fi
+    KEPT+=("$(rel "$dest")")
+    info "kept $(rel "$dest") (contains comments/invalid JSON, cannot merge safely; --force replaces)"
+    return 0
+  fi
+  commit_file "$TMP_LAST" "$dest" "$mode" 0
+}
+
+OURS=""
+# put_str <dest> <kind> <mode> <content>   (a trailing newline is appended)
+put_str() {
+  mk_tmp
+  printf '%s\n' "$4" >"$TMP_LAST"
+  OURS=$TMP_LAST
+  put_file "$1" "$2" "$3"
+}
+
+declare -A TOK=()
+# put_tpl <dest> <kind> <mode>   (template on stdin, @KEY@ tokens from TOK)
+put_tpl() {
+  local s k
+  s=$(
+    cat
+    printf x
+  )
+  s=${s%x}
+  for k in "${!TOK[@]}"; do s=${s//"@${k}@"/${TOK[$k]}}; done
+  if [[ $s =~ @[A-Z][A-Z0-9_]*@ ]]; then
+    die 1 "internal error: unresolved template token ${BASH_REMATCH[0]} for $(rel "$1")"
+  fi
+  mk_tmp
+  printf '%s' "$s" >"$TMP_LAST"
+  OURS=$TMP_LAST
+  put_file "$1" "${2:-text}" "${3:-644}"
+}
+
+# Managed block in a text file (idempotent; preserves everything else).
+BLOCK_BEGIN="# >>> zide >>>"
+BLOCK_END="# <<< zide <<<"
+put_block() { # <dest> <block-body>
+  local dest=$1 body=$2 stripped="" new
+  if [[ -f $dest ]]; then
+    stripped=$(awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '$0==b{s=1;next} $0==e{s=0;next} !s{print}' "$dest")
+  fi
+  new="${stripped:+$stripped$'\n\n'}${BLOCK_BEGIN}"$'\n'"${body}"$'\n'"${BLOCK_END}"
+  mk_tmp
+  printf '%s\n' "$new" >"$TMP_LAST"
+  if [[ -f $dest ]] && ! cmp -s -- "$TMP_LAST" "$dest"; then
+    # Pure append / block refresh: the user's own lines are preserved verbatim.
+    local r
+    r=$(rel "$dest")
+    backup_file "$dest"
+    if ((DRY_RUN)); then dry "patch $r"; else install -m 644 -- "$TMP_LAST" "$dest"; fi
+    UPDATED+=("$r (managed block)")
+    return 0
+  fi
+  commit_file "$TMP_LAST" "$dest" 644 0
+}
+
+# Symlink ROOT/compile_commands.json -> relative target.
+link_compdb() { # <relative-target>
+  local target=$1 link=$ROOT/compile_commands.json cur
+  if [[ -L $link ]]; then
+    cur=$(readlink -- "$link")
+    if [[ $cur == "$target" ]]; then
+      UNCHANGED+=("compile_commands.json -> $target")
+      return 0
+    fi
+    if [[ $cur == build/* || $cur == cmake-build-*/* ]] || ((FORCE)); then
+      if ((DRY_RUN)); then dry "relink compile_commands.json -> $target"; else ln -sfn -- "$target" "$link"; fi
+      UPDATED+=("compile_commands.json -> $target")
+      return 0
+    fi
+  elif [[ -e $link ]] && ((!FORCE)); then
+    KEPT+=("compile_commands.json")
+    info "kept existing compile_commands.json (regular file)"
+    return 0
+  elif [[ -e $link ]]; then
+    backup_file "$link"
+  fi
+  if [[ -L $link ]]; then
+    KEPT+=("compile_commands.json (symlink -> $(readlink -- "$link"))")
+    return 0
+  fi
+  if ((DRY_RUN)); then dry "symlink compile_commands.json -> $target"; else ln -sfn -- "$target" "$link"; fi
+  CREATED+=("compile_commands.json -> $target")
+}
+
+# Run an external command; capture output and show the tail on failure.
+try_run() { # <description> <cmd...>
+  local desc=$1 rc=0
+  shift
+  if ((DRY_RUN)); then
+    dry "$desc: $*"
+    return 0
+  fi
+  mk_tmp
+  info "$desc"
+  "$@" >"$TMP_LAST" 2>&1 || rc=$?
+  if ((rc)); then
+    warn "$desc failed (exit $rc); last output:"
+    tail -n 8 "$TMP_LAST" | sed 's/^/        /' >&2
+    return 1
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Small JSON emitters (deterministic, no jq needed to generate)
+# --------------------------------------------------------------------------
+jstr() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  printf '"%s"' "$s"
+}
+jarr() {
+  local out="" a
+  for a in "$@"; do out+="${out:+, }$(jstr "$a")"; done
+  printf '[%s]' "$out"
+}
+
+TASKS=() DEBUGS=()
+# add_task <label> <hide|""> <command> [args...]
+add_task() {
+  local label=$1 hide=$2 cmd=$3 o
+  shift 3
+  o=$(printf '  {\n    "label": %s,\n    "command": %s,\n    "args": %s,\n    "cwd": "$ZED_WORKTREE_ROOT"' \
+    "$(jstr "$label")" "$(jstr "$cmd")" "$(jarr "$@")")
+  if [[ -n $hide ]]; then o+=$(printf ',\n    "hide": %s' "$(jstr "$hide")"); fi
+  TASKS+=("$o"$'\n  }')
+}
+# add_debug <label> <adapter> <program-relative-to-root> <build-task-label|"">
+add_debug() {
+  local o
+  o=$(printf '  {\n    "label": %s,\n    "adapter": %s,\n    "request": "launch",\n    "program": %s,\n    "cwd": "$ZED_WORKTREE_ROOT"' \
+    "$(jstr "$1")" "$(jstr "$2")" "$(jstr "\$ZED_WORKTREE_ROOT/$3")")
+  if [[ -n $4 ]]; then o+=$(printf ',\n    "build": %s' "$(jstr "$4")"); fi
+  DEBUGS+=("$o"$'\n  }')
+}
+emit_array() {
+  local i n=$#
+  printf '[\n'
+  for ((i = 1; i <= n; i++)); do
+    printf '%s' "${!i}"
+    if ((i < n)); then printf ',\n'; else printf '\n'; fi
+  done
+  printf ']'
+}
+join_by() { # <sep> items...
+  local sep=$1 out="" first=1 x
+  shift
+  for x in "$@"; do
+    if ((first)); then out=$x first=0; else out+="$sep$x"; fi
+  done
+  printf '%s' "$out"
+}
+
+# --------------------------------------------------------------------------
+# Shared Zed / clang config generators
+# --------------------------------------------------------------------------
+STYLE=llvm
+zed_lang_block() { # <Zed language name> <formatter: language_server|default>
+  if [[ $2 == language_server ]]; then
+    printf '    %s: {\n      "tab_size": 4,\n      "format_on_save": "on",\n      "formatter": "language_server",\n      "inlay_hints": { "enabled": true }\n    }' "$(jstr "$1")"
+  else
+    printf '    %s: {\n      "tab_size": 4,\n      "format_on_save": "on",\n      "inlay_hints": { "enabled": true }\n    }' "$(jstr "$1")"
+  fi
+}
+
+zed_settings() { # has_c has_cpp has_rust
+  local -a langs=() lsp=()
+  if (($1)); then langs+=("$(zed_lang_block C language_server)"); fi
+  if (($2)); then langs+=("$(zed_lang_block 'C++' language_server)"); fi
+  if (($3)); then langs+=("$(zed_lang_block Rust default)"); fi
+  if (($1 || $2)); then
+    lsp+=('    "clangd": {
+      "binary": {
+        "arguments": [
+          "--background-index",
+          "--clang-tidy",
+          "--header-insertion=iwyu",
+          "--completion-style=detailed"
+        ]
+      }
+    }')
+  fi
+  if (($3)); then
+    lsp+=('    "rust-analyzer": {
+      "initialization_options": {
+        "check": { "command": "clippy" },
+        "cargo": { "allTargets": true }
+      }
+    }')
+  fi
+  printf '{\n  "languages": {\n%s\n  },\n  "lsp": {\n%s\n  }\n}' \
+    "$(join_by $',\n' "${langs[@]}")" "$(join_by $',\n' "${lsp[@]}")"
+}
+
+# tasks_cmake <preset|""> <build-dir> <use_preset_for_build:0|1> targets...
+tasks_cmake() {
+  local preset=$1 dir=$2 usep=$3 t first=1
+  shift 3
+  local -a gen=()
+  if have ninja; then gen=(-G Ninja); fi
+  # Self-healing prefix for the compound tasks: configure on first use so
+  # build/run/rebuild also work on a fresh checkout without running the
+  # "configure" task first. Re-running configure over an existing cache keeps
+  # already-set variables, and `cmake --build` re-runs it when CMake files
+  # changed, so the guard is only a first-run safety net.
+  local cfg bld
+  if [[ -n $preset ]]; then
+    add_task "configure" "" cmake --preset "$preset"
+  else
+    add_task "configure" "" cmake -S . -B "$dir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}"
+  fi
+  if ((usep)); then
+    cfg="[ -f $dir/CMakeCache.txt ] || cmake --preset $preset"
+    bld="cmake --build --preset $preset"
+    add_task "build" on_success cmake --build --preset "$preset"
+    add_task "clean" "" cmake --build --preset "$preset" --target clean
+    add_task "rebuild" on_success bash -c "$cfg && cmake --build --preset $preset --target clean && cmake --build --preset $preset"
+    add_task "test" on_success ctest --preset "$preset"
+  else
+    cfg="[ -f $dir/CMakeCache.txt ] || cmake -S . -B $dir -DCMAKE_EXPORT_COMPILE_COMMANDS=ON${gen:+ ${gen[*]}}"
+    bld="cmake --build $dir"
+    add_task "build" on_success cmake --build "$dir"
+    add_task "clean" "" cmake --build "$dir" --target clean
+    add_task "rebuild" on_success bash -c "$cfg && cmake --build $dir --target clean && cmake --build $dir"
+    add_task "test" on_success ctest --test-dir "$dir" --output-on-failure
+  fi
+  for t in "$@"; do
+    if ((first)); then
+      add_task "run" "" bash -c "$cfg && $bld && exec ./$dir/$t"
+      first=0
+    fi
+    add_task "run: $t" "" bash -c "$cfg && $bld && exec ./$dir/$t"
+  done
+}
+
+tasks_cargo() {
+  add_task "build" on_success cargo build
+  add_task "build: release" on_success cargo build --release
+  add_task "check" on_success cargo check --all-targets
+  add_task "clippy" on_success cargo clippy --all-targets -- -D warnings
+  add_task "test" on_success cargo test
+  add_task "run" "" cargo run
+  add_task "clean" "" cargo clean
+  add_task "fmt" on_success cargo fmt --all
+}
+
+clang_format_text() {
+  local base
+  case $STYLE in
+    mozilla) base=Mozilla ;;
+    google) base=Google ;;
+    *) base=LLVM ;;
+  esac
+  printf 'BasedOnStyle: %s\nIndentWidth: 4\nColumnLimit: 100\nSortIncludes: CaseSensitive\nDerivePointerAlignment: false\nPointerAlignment: Left\n' "$base"
+}
+
+clangd_text() { # <compilation-db-dir or ".">
+  printf '# Generated by zide. clangd reads this per-project configuration.\nCompileFlags:\n  CompilationDatabase: %s\n  Add: [-Wall, -Wextra]\nIndex:\n  Background: Build\nInlayHints:\n  Enabled: Yes\n  ParameterNames: Yes\n  DeducedTypes: Yes\n' "$1"
+}
+
+clang_tidy_text() {
+  cat <<'EOF'
+# Generated by zide.
+Checks: 'bugprone-*,performance-*,portability-*,readability-*,modernize-use-nullptr,modernize-use-override,-readability-magic-numbers,-readability-identifier-length'
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/(include|src)/.*'
+FormatStyle: file
+EOF
+}
+
+gitignore_body() {
+  cat <<'EOF'
+/build/
+/build-*/
+/cmake-build-*/
+/.cache/
+/compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.gcda
+*.gcno
+*.profraw
+*.bak.*
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Detection
+# --------------------------------------------------------------------------
+FILES=()
+DETECT_C=0 DETECT_CPP=0 DETECT_RUST=0 HAS_H=0
+BUILDS=()
+CC_BUILD=none
+
+scan_files() {
+  FILES=()
+  local f
+  while IFS= read -r f; do
+    FILES+=("${f#"$ROOT"/}")
+  done < <(find "$ROOT" -mindepth 1 -maxdepth 8 \
+    \( -name .git -o -name build -o -name 'build-*' -o -name 'cmake-build-*' -o -name target \
+    -o -name node_modules -o -name third_party -o -name vendor -o -name external \
+    -o -name .cache -o -name .zed \) -prune -o -type f -print 2>/dev/null | LC_ALL=C sort)
+}
+
+detect_languages() {
+  local f
+  DETECT_C=0 DETECT_CPP=0 DETECT_RUST=0 HAS_H=0
+  for f in "${FILES[@]}"; do
+    case $f in
+      *.c) DETECT_C=1 ;;
+      *.cc | *.cpp | *.cxx | *.hpp | *.hh | *.hxx | *.ipp | *.tcc) DETECT_CPP=1 ;;
+      *.h) HAS_H=1 ;;
+      *.rs) DETECT_RUST=1 ;;
+    esac
+  done
+  if [[ -f $ROOT/Cargo.toml ]]; then DETECT_RUST=1; fi
+  if ((HAS_H && !DETECT_C && !DETECT_CPP)); then DETECT_C=1; fi
+}
+
+detect_builds() {
+  BUILDS=()
+  if [[ -f $ROOT/CMakeLists.txt ]]; then BUILDS+=(cmake); fi
+  if [[ -f $ROOT/meson.build ]]; then BUILDS+=(meson); fi
+  if [[ -f $ROOT/Makefile || -f $ROOT/makefile || -f $ROOT/GNUmakefile ]]; then BUILDS+=(make); fi
+  if [[ -f $ROOT/MODULE.bazel || -f $ROOT/WORKSPACE || -f $ROOT/WORKSPACE.bazel || -f $ROOT/BUILD.bazel ]]; then BUILDS+=(bazel); fi
+  if [[ -f $ROOT/Cargo.toml ]]; then BUILDS+=(cargo); fi
+  CC_BUILD=none
+  local b
+  for b in "${BUILDS[@]}"; do
+    if [[ $b != cargo ]]; then CC_BUILD=$b; break; fi
+  done
+}
+
+langs_label() {
+  local -a x=()
+  if ((DETECT_C)); then x+=(C); fi
+  if ((DETECT_CPP)); then x+=("C++"); fi
+  if ((DETECT_RUST)); then x+=(Rust); fi
+  if ((${#x[@]})); then join_by ', ' "${x[@]}"; else printf 'none'; fi
+}
+
+make_ident() {
+  local s
+  s=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_' '_' | tr -s '_')
+  s=${s#_}
+  s=${s%_}
+  if [[ -z $s ]]; then return 1; fi
+  if [[ $s =~ ^[0-9] ]]; then s="p_$s"; fi
+  printf '%s' "$s"
+}
+
+cmake_exe_targets() {
+  local f
+  for f in "${FILES[@]}"; do
+    case $f in
+      CMakeLists.txt | */CMakeLists.txt)
+        { grep -ohE 'add_executable[[:space:]]*\([[:space:]]*[A-Za-z0-9_.+-]+' "$ROOT/$f" || true; } |
+          sed -E 's/.*\([[:space:]]*//'
+        ;;
+    esac
+  done | awk '!seen[$0]++'
+}
+
+cargo_pkg_name() {
+  awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name[[:space:]]*=/{gsub(/^[^"]*"|".*$/,""); print; exit}' "$ROOT/Cargo.toml"
+}
+
+# --------------------------------------------------------------------------
+# Mode 1: adopt
+# --------------------------------------------------------------------------
+NO_CMAKE=0 NO_CONFIGURE=0
+C_STD=17 CXX_STD=20
+BUILD_DIR="" PRESET="" DB_DIR="."
+
+adopt_generate_cmakelists() {
+  local name ident langs f body="" tgt inc n_main=0
+  local -a libs=() mains=() incs=() std=()
+  name=$(basename -- "$ROOT")
+  ident=$(make_ident "$name") || ident=project
+  for f in "${FILES[@]}"; do
+    case $f in
+      tests/* | test/* | */tests/* | */test/* | benchmarks/* | bench/* | */benchmarks/* | examples/* | */examples/* | docs/* | */docs/*) continue ;;
+      *.c | *.cc | *.cpp | *.cxx)
+        if grep -qE '^[[:space:]]*(int|auto)[[:space:]]+main[[:space:]]*\(' "$ROOT/$f"; then
+          mains+=("$f")
+        else
+          libs+=("$f")
+        fi
+        ;;
+    esac
+  done
+  if ((${#libs[@]} + ${#mains[@]} == 0)); then
+    warn "no translation units found; not generating CMakeLists.txt"
+    return 0
+  fi
+  n_main=${#mains[@]}
+  if ((DETECT_CPP)); then
+    if ((DETECT_C)); then langs="C CXX"; else langs="CXX"; fi
+  else
+    langs="C"
+  fi
+  if ((DETECT_C)); then std+=("set(CMAKE_C_STANDARD $C_STD)" "set(CMAKE_C_STANDARD_REQUIRED ON)" "set(CMAKE_C_EXTENSIONS OFF)"); fi
+  if ((DETECT_CPP)); then std+=("set(CMAKE_CXX_STANDARD $CXX_STD)" "set(CMAKE_CXX_STANDARD_REQUIRED ON)" "set(CMAKE_CXX_EXTENSIONS OFF)"); fi
+  for inc in include src; do
+    if [[ -d $ROOT/$inc ]]; then incs+=("\${CMAKE_CURRENT_SOURCE_DIR}/$inc"); fi
+  done
+  if ((${#incs[@]} == 0)); then incs+=("\${CMAKE_CURRENT_SOURCE_DIR}"); fi
+
+  body="# Generated by zide from the sources found in this tree. Review before relying on it.
+cmake_minimum_required(VERSION 3.16)
+project(${ident} LANGUAGES ${langs})
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+$(printf '%s\n' "${std[@]}")
+"
+  if ((${#libs[@]})); then
+    body+="
+add_library(${ident}_core"$'\n'
+    for f in "${libs[@]}"; do body+="  $f"$'\n'; done
+    body+=")"$'\n'
+    body+="target_include_directories(${ident}_core PUBLIC ${incs[*]})"$'\n'
+  fi
+  for f in "${mains[@]}"; do
+    if ((n_main == 1)); then
+      tgt=$ident
+    else
+      tgt="${ident}_$(make_ident "$(basename -- "${f%.*}")")"
+    fi
+    body+=$'\n'"add_executable(${tgt} $f)"$'\n'
+    if ((${#libs[@]})); then
+      body+="target_link_libraries(${tgt} PRIVATE ${ident}_core)"$'\n'
+    else
+      body+="target_include_directories(${tgt} PRIVATE ${incs[*]})"$'\n'
+    fi
+  done
+  put_str "$ROOT/CMakeLists.txt" text 644 "$body"
+}
+
+adopt_compdb() {
+  local gen=() db
+  if ((!DETECT_C && !DETECT_CPP)); then return 0; fi
+  if have ninja; then gen=(-G Ninja); fi
+  case $CC_BUILD in
+    cmake)
+      BUILD_DIR=build/zide PRESET=""
+      if [[ -L $ROOT/compile_commands.json ]]; then
+        db=$(readlink -- "$ROOT/compile_commands.json")
+        if [[ $db == */* ]]; then BUILD_DIR=$(dirname -- "$db"); fi
+      elif [[ -f $ROOT/CMakePresets.json ]] && have jq &&
+        jq -e '.configurePresets[]? | select(.name=="dev")' -- "$ROOT/CMakePresets.json" >/dev/null 2>&1; then
+        PRESET=dev BUILD_DIR=build/dev
+      fi
+      DB_DIR=$BUILD_DIR
+      if ((NO_CONFIGURE)); then
+        info "--no-configure: skipping cmake configure"
+      elif [[ ! -f $ROOT/$BUILD_DIR/compile_commands.json ]]; then
+        if ! have cmake; then
+          warn "cmake not found; cannot export compile_commands.json -> $(install_hint cmake)"
+        elif [[ -n $PRESET ]]; then
+          (cd "$ROOT" && try_run "cmake --preset dev (exporting compile commands)" \
+            cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON) || true
+        else
+          try_run "cmake configure -> $BUILD_DIR (exporting compile commands)" \
+            cmake -S "$ROOT" -B "$ROOT/$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}" || true
+        fi
+      fi
+      if [[ -f $ROOT/$BUILD_DIR/compile_commands.json ]] && [[ ! -e $ROOT/compile_commands.json || -L $ROOT/compile_commands.json ]]; then
+        link_compdb "$BUILD_DIR/compile_commands.json"
+      elif ((!DRY_RUN)) && [[ ! -e $ROOT/compile_commands.json ]]; then
+        warn "compile_commands.json not produced yet; run the 'configure' task (clangd will find it in $BUILD_DIR)"
+      fi
+      ;;
+    meson)
+      BUILD_DIR=build/zide DB_DIR=build/zide
+      if ((NO_CONFIGURE)); then
+        :
+      elif ! have meson; then
+        warn "meson not found -> $(install_hint meson)"
+      elif [[ ! -f $ROOT/$BUILD_DIR/build.ninja ]]; then
+        try_run "meson setup $BUILD_DIR" meson setup "$ROOT/$BUILD_DIR" "$ROOT" || true
+      fi
+      if [[ -f $ROOT/$BUILD_DIR/compile_commands.json ]]; then link_compdb "$BUILD_DIR/compile_commands.json"; fi
+      ;;
+    make)
+      DB_DIR="."
+      if [[ -e $ROOT/compile_commands.json || $NO_CONFIGURE -eq 1 ]]; then
+        :
+      elif have compiledb; then
+        try_run "compiledb -n make (no build performed)" bash -c 'cd -- "$1" && compiledb -n make' _ "$ROOT" || true
+      elif have bear; then
+        warn "bear must run a real build; forcing 'make -B' so every file is compiled"
+        try_run "bear -- make -B" bash -c 'cd -- "$1" && bear -- make -B -j"$(nproc)"' _ "$ROOT" || true
+      else
+        warn "no compile_commands generator for Make -> $(install_hint bear)  (or: $(install_hint compiledb))"
+      fi
+      ;;
+    bazel)
+      DB_DIR="."
+      warn "Bazel: generate compile_commands.json with hedronvision/bazel-compile-commands-extractor (zide does not fetch it)"
+      ;;
+    *) DB_DIR="." ;;
+  esac
+}
+
+adopt_zed() {
+  local -a targets=()
+  local name t
+  name=$(basename -- "$ROOT")
+  TASKS=() DEBUGS=()
+  if ((DETECT_C || DETECT_CPP)); then
+    case $CC_BUILD in
+      cmake)
+        mapfile -t targets < <(cmake_exe_targets)
+        if ((${#targets[@]} == 0)); then
+          targets=("$(make_ident "$name" || echo app)")
+          warn "no add_executable target detected; guessing binary name '${targets[0]}' (fix .zed/tasks.json if the binary is named differently)"
+        elif ((${#targets[@]} > 24)); then
+          warn "found ${#targets[@]} executables; generating run/debug entries for the first 24 (add the rest to .zed/tasks.json manually)"
+          targets=("${targets[@]:0:24}")
+        fi
+        if [[ -n $PRESET ]]; then
+          tasks_cmake "$PRESET" "$BUILD_DIR" 0 "${targets[@]}"
+        else
+          tasks_cmake "" "$BUILD_DIR" 0 "${targets[@]}"
+        fi
+        for t in "${targets[@]}"; do
+          add_debug "Debug $t (CodeLLDB)" CodeLLDB "$BUILD_DIR/$t" build
+          add_debug "Debug $t (GDB)" GDB "$BUILD_DIR/$t" build
+        done
+        ;;
+      meson)
+        add_task "configure" "" bash -c "meson setup --reconfigure build/zide 2>/dev/null || meson setup build/zide"
+        add_task "build" on_success meson compile -C build/zide
+        add_task "clean" "" meson compile -C build/zide --clean
+        add_task "test" on_success meson test -C build/zide --print-errorlogs
+        add_debug "Debug $name (CodeLLDB)" CodeLLDB "build/zide/$name" build
+        add_debug "Debug $name (GDB)" GDB "build/zide/$name" build
+        ;;
+      make)
+        add_task "build" on_success bash -c 'make -j"$(nproc 2>/dev/null || echo 2)"'
+        add_task "clean" "" make clean
+        add_task "rebuild" on_success bash -c "make clean && make -j\$(nproc)"
+        add_task "test" on_success make test
+        add_debug "Debug $name (CodeLLDB)" CodeLLDB "$name" build
+        add_debug "Debug $name (GDB)" GDB "$name" build
+        ;;
+      bazel)
+        add_task "build" on_success bazel build //...
+        add_task "test" on_success bazel test //...
+        add_task "clean" "" bazel clean
+        ;;
+    esac
+  fi
+  if ((DETECT_RUST)) && [[ -f $ROOT/Cargo.toml ]]; then
+    local pkg
+    pkg=$(cargo_pkg_name)
+    pkg=${pkg:-$name}
+    if ((DETECT_C || DETECT_CPP)); then
+      add_task "cargo build" on_success cargo build
+      add_task "cargo test" on_success cargo test
+      add_task "cargo run" "" cargo run
+      add_task "cargo clippy" on_success cargo clippy --all-targets -- -D warnings
+      add_debug "Debug $pkg (Rust, CodeLLDB)" CodeLLDB "target/debug/$pkg" "cargo build"
+    else
+      tasks_cargo
+      add_debug "Debug $pkg (CodeLLDB)" CodeLLDB "target/debug/$pkg" build
+      add_debug "Debug $pkg (GDB)" GDB "target/debug/$pkg" build
+    fi
+  fi
+  if ((${#TASKS[@]} == 0)); then
+    warn "no recognised build system; writing settings only (no tasks/debug profiles)"
+  fi
+  put_str "$ROOT/.zed/settings.json" json-object 644 "$(zed_settings "$DETECT_C" "$DETECT_CPP" "$DETECT_RUST")"
+  if ((${#TASKS[@]})); then put_str "$ROOT/.zed/tasks.json" json-array 644 "$(emit_array "${TASKS[@]}")"; fi
+  if ((${#DEBUGS[@]})); then put_str "$ROOT/.zed/debug.json" json-array 644 "$(emit_array "${DEBUGS[@]}")"; fi
+}
+
+adopt_clang() {
+  if ((!DETECT_C && !DETECT_CPP)); then return 0; fi
+  put_str "$ROOT/.clangd" text 644 "$(clangd_text "$DB_DIR")"
+  put_str "$ROOT/.clang-format" text 644 "$(clang_format_text)"
+  put_str "$ROOT/.clang-tidy" text 644 "$(clang_tidy_text)"
+}
+
+print_report() {
+  local title=$1 x
+  local dr=""
+  if ((DRY_RUN)); then dr=" (dry run: nothing written)"; fi
+  printf '\n%s%s%s%s\n' "$C_BOLD" "$title" "$dr" "$C_RESET"
+  printf '  project : %s\n' "$ROOT"
+  if [[ $title == *adoption* ]]; then
+    printf '  languages: %s\n  build   : %s (primary C/C++: %s)\n' "$(langs_label)" "${BUILDS[*]:-none}" "$CC_BUILD"
+  fi
+  printf '  created : %d\n' "${#CREATED[@]}"
+  for x in "${CREATED[@]}"; do printf '      + %s\n' "$x"; done
+  printf '  modified: %d\n' "${#UPDATED[@]}"
+  for x in "${UPDATED[@]}"; do printf '      ~ %s\n' "$x"; done
+  printf '  unchanged: %d   kept (yours): %d   backups: %d   warnings: %d\n' \
+    "${#UNCHANGED[@]}" "${#KEPT[@]}" "${#BACKUPS[@]}" "${#WARNINGS[@]}"
+  for x in "${KEPT[@]}"; do printf '      = %s\n' "$x"; done
+  printf '  toolchain:\n'
+  print_toolchain
+}
+
+cmd_adopt() {
+  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "adopt: missing <project-path>"
+  ROOT=$(safe_path "$POS_PATH")
+  [[ -d $ROOT ]] || die "$E_USAGE" "adopt: not a directory: $ROOT"
+  scan_files
+  detect_languages
+  detect_builds
+  info "adopting $ROOT"
+  info "languages: $(langs_label); build systems: ${BUILDS[*]:-none}"
+  if ((DETECT_C || DETECT_CPP)); then
+    need_tool clangd 1 "language server"
+    need_tool cmake 0
+    need_tool ninja 0
+    need_tool jq 0 "JSON validation and safe merging"
+    need_tool clang-format 0
+  fi
+  if ((DETECT_RUST)); then
+    need_tool cargo 1
+    need_tool rust-analyzer 1
+  fi
+  need_tool gdb 0 "debugger"
+  need_tool lldb 0 "debugger (CodeLLDB is bundled with Zed)"
+  if ((!DETECT_C && !DETECT_CPP && !DETECT_RUST)); then
+    die "$E_USAGE" "no C, C++ or Rust sources found under $ROOT"
+  fi
+  if (((DETECT_C || DETECT_CPP) && ${#BUILDS[@]} == 0 && !NO_CMAKE)); then
+    info "no build system found; generating a CMakeLists.txt from the sources"
+    adopt_generate_cmakelists
+    # The file list predates the generated CMakeLists.txt; rescan so target
+    # detection in adopt_zed sees it (otherwise run tasks guess a wrong name).
+    scan_files
+    detect_builds
+  fi
+  adopt_compdb
+  adopt_zed
+  adopt_clang
+  put_block "$ROOT/.gitignore" "$(gitignore_body)"
+  ok "adoption finished"
+  print_report "Post-adoption report"
+  printf '\nNext steps:\n  1. zed %q\n  2. Command palette -> "task: spawn" -> configure, build, test\n  3. If compile_commands.json is missing, run the "configure" task, then "editor: restart language server".\n' "$ROOT"
+}
+
+# --------------------------------------------------------------------------
+# Mode 2: init
+# --------------------------------------------------------------------------
+LANG_SEL="" INIT_NAME="" TESTFW="" LICENSE_SEL="" AUTHOR="" YEAR=""
+STRICT="" GIT=1 BENCH=0 BARE_REMOTE="" GENERATOR=auto STD_SET=0
+IDENT="" CRATE=""
+
+norm_lang() {
+  case ${1,,} in
+    c) echo c ;;
+    cpp | c++ | cxx) echo cpp ;;
+    rust | rs) echo rust ;;
+    c-cpp-mixed | mixed | c-cpp | c+cpp) echo mixed ;;
+    *) return 1 ;;
+  esac
+}
+norm_test() {
+  case ${1,,} in
+    ctest | smoke) echo ctest ;;
+    catch2 | ctest-catch2) echo catch2 ;;
+    doctest | ctest-doctest) echo doctest ;;
+    gtest | googletest | ctest-gtest) echo gtest ;;
+    cargo | cargo-test) echo cargo ;;
+    none) echo none ;;
+    *) return 1 ;;
+  esac
+}
+norm_license() {
+  case ${1,,} in
+    mit) echo MIT ;;
+    apache2 | apache-2.0 | apache) echo Apache-2.0 ;;
+    bsd3 | bsd-3-clause | bsd) echo BSD-3-Clause ;;
+    gpl3 | gpl-3.0 | gpl-3.0-or-later | gpl) echo GPL-3.0-or-later ;;
+    none) echo none ;;
+    *) return 1 ;;
+  esac
+}
+
+ask() { # <var> <prompt> <default>
+  local -n ref=$1
+  local ans
+  if [[ -n $ref ]] || ((YES)) || [[ ! -t 0 || ! -t 2 ]]; then
+    ref=${ref:-$3}
+    return 0
+  fi
+  read -r -p "$2 [$3]: " ans || ans=""
+  ref=${ans:-$3}
+}
+
+emit_license() {
+  local kind=$1 year=$2 holder=$3 f
+  case $kind in
+    MIT)
+      cat <<EOF
+MIT License
+
+Copyright (c) $year $holder
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+      ;;
+    BSD-3-Clause)
+      cat <<EOF
+BSD 3-Clause License
+
+Copyright (c) $year $holder
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+EOF
+      ;;
+    Apache-2.0 | GPL-3.0-or-later)
+      f=/usr/share/common-licenses/Apache-2.0
+      if [[ $kind == GPL-3.0-or-later ]]; then f=/usr/share/common-licenses/GPL-3; fi
+      if [[ -r $f ]]; then
+        cat -- "$f"
+      else
+        printf '%s\n\nCopyright (c) %s %s\n\nThe full license text was not available offline when this project was\ngenerated. Replace this file with the canonical text from:\n  %s\n' \
+          "$kind" "$year" "$holder" \
+          "$([[ $kind == Apache-2.0 ]] && echo https://www.apache.org/licenses/LICENSE-2.0.txt || echo https://www.gnu.org/licenses/gpl-3.0.txt)"
+        warn "full $kind text not found in /usr/share/common-licenses; wrote a short notice instead"
+      fi
+      ;;
+  esac
+}
+
+init_resolve() {
+  ask LANG_SEL "Language (c | cpp | rust | c-cpp-mixed)" cpp
+  LANG_SEL=$(norm_lang "$LANG_SEL") || die "$E_USAGE" "invalid --lang (use c | cpp | rust | c-cpp-mixed)"
+  if [[ $LANG_SEL == rust ]]; then
+    TESTFW=cargo
+  else
+    if ((!STD_SET)) && [[ -t 0 && -t 2 ]] && ((!YES)); then
+      case $LANG_SEL in
+        c) read -r -p "C standard (11|17|23) [17]: " ans || ans=""; C_STD=${ans:-17} ;;
+        *) read -r -p "C++ standard (17|20|23) [20]: " ans || ans=""; CXX_STD=${ans:-20} ;;
+      esac
+    fi
+    ask TESTFW "Test framework (ctest | catch2 | doctest | gtest | none)" ctest
+    TESTFW=$(norm_test "$TESTFW") || die "$E_USAGE" "invalid --test"
+    if [[ $TESTFW == cargo ]]; then die "$E_USAGE" "--test cargo only applies to --lang rust"; fi
+  fi
+  ask LICENSE_SEL "License (mit | apache2 | bsd3 | gpl3 | none)" mit
+  LICENSE_SEL=$(norm_license "$LICENSE_SEL") || die "$E_USAGE" "invalid --license"
+  if [[ -z $STRICT ]]; then
+    local s=""
+    ask s "Strict warnings -Wall -Wextra -Wpedantic -Werror? (y/n)" n
+    case ${s,,} in y | yes) STRICT=1 ;; *) STRICT=0 ;; esac
+  fi
+  # NOTE: --std sets both C_STD and CXX_STD at parse time; validate only the
+  # language(s) actually used, otherwise e.g. --std 20 fails for C++ projects.
+  case $LANG_SEL in
+    c) [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23)" ;;
+    cpp) [[ $CXX_STD =~ ^(17|20|23)$ ]] || die "$E_USAGE" "unsupported C++ standard: $CXX_STD (use 17, 20 or 23)" ;;
+    mixed)
+      [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23)"
+      [[ $CXX_STD =~ ^(17|20|23)$ ]] || die "$E_USAGE" "unsupported C++ standard: $CXX_STD (use 17, 20 or 23)"
+      ;;
+  esac
+  if [[ -z $INIT_NAME ]]; then INIT_NAME=$(basename -- "$ROOT"); fi
+  if [[ $LANG_SEL == rust ]]; then
+    CRATE=$(printf '%s' "$INIT_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | tr -s '-')
+    CRATE=${CRATE#-}
+    CRATE=${CRATE%-}
+    [[ $CRATE =~ ^[a-z] ]] || die "$E_USAGE" "crate name must start with a letter: '$INIT_NAME'"
+    IDENT=${CRATE//-/_}
+  else
+    IDENT=$(make_ident "$INIT_NAME") || die "$E_USAGE" "cannot derive a valid identifier from '$INIT_NAME'"
+  fi
+  AUTHOR=${AUTHOR:-$(git config --get user.name 2>/dev/null || true)}
+  AUTHOR=${AUTHOR:-${USER:-author}}
+  YEAR=${YEAR:-$(date +%Y)}
+}
+
+init_tokens() {
+  local langs std ext hdr add
+  case $LANG_SEL in
+    c)
+      langs=C ext=c hdr="$IDENT/$IDENT.h" add="${IDENT}_add"
+      std="set(CMAKE_C_STANDARD $C_STD)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)"
+      ;;
+    cpp)
+      langs=CXX ext=cpp hdr="$IDENT/$IDENT.hpp" add="${IDENT}::add"
+      std="set(CMAKE_CXX_STANDARD $CXX_STD)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)"
+      ;;
+    mixed)
+      langs="C CXX" ext=cpp hdr="$IDENT/$IDENT.hpp" add="${IDENT}::add"
+      std="set(CMAKE_C_STANDARD $C_STD)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD $CXX_STD)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)"
+      ;;
+    *) langs="" ext="" hdr="" add="" std="" ;;
+  esac
+  local gen
+  gen=$GENERATOR
+  if [[ $gen == auto ]]; then
+    if have ninja; then gen=ninja; else gen="make"; fi
+  fi
+  if [[ $gen == ninja ]]; then
+    TOK[GENERATOR_LINE]='"generator": "Ninja",'
+  else
+    TOK[GENERATOR_LINE]='"generator": "Unix Makefiles",'
+  fi
+  TOK[NAME]=$INIT_NAME TOK[IDENT]=$IDENT TOK[UPPER]=${IDENT^^} TOK[LANGS]=$langs
+  TOK[EXT]=$ext TOK[HDR]=$hdr TOK[ADD]=$add TOK[STD_BLOCK]=$std
+  TOK[STRICT_ONOFF]=$([[ $STRICT == 1 ]] && echo ON || echo OFF)
+  TOK[STRICT_JSON]=$([[ $STRICT == 1 ]] && echo ON || echo OFF)
+  TOK[BENCH_ONOFF]=$([[ $BENCH == 1 ]] && echo ON || echo OFF)
+  TOK[TESTFW]=$TESTFW TOK[CRATE]=$CRATE TOK[LICENSE]=$LICENSE_SEL
+  TOK[STYLE]=$STYLE TOK[LANG]=$LANG_SEL
+}
+
+init_cmake_project() {
+  local core_srcs
+  case $LANG_SEL in
+    c) core_srcs="src/${IDENT}.c" ;;
+    cpp) core_srcs="src/${IDENT}.cpp" ;;
+    mixed) core_srcs="src/${IDENT}_c.c src/${IDENT}.cpp" ;;
+  esac
+  TOK[CORE_SRCS]=$core_srcs
+
+  put_tpl "$ROOT/CMakeLists.txt" text 644 <<'EOF'
+cmake_minimum_required(VERSION 3.21)
+project(@IDENT@ VERSION 0.1.0 LANGUAGES @LANGS@)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+  message(FATAL_ERROR "In-source builds are disabled. Use: cmake --preset dev")
+endif()
+
+@STD_BLOCK@
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+option(@UPPER@_STRICT "Build with -Wall -Wextra -Wpedantic -Werror" @STRICT_ONOFF@)
+option(@UPPER@_BUILD_TESTS "Build the test suite" ON)
+option(@UPPER@_BUILD_BENCHMARKS "Build the benchmarks" @BENCH_ONOFF@)
+
+# Sanitizer presets set both C and C++ flags; read them so single-language projects
+# do not trigger CMake's "manually-specified variables were not used" warning.
+set(_zide_flags_seen "${CMAKE_C_FLAGS}${CMAKE_CXX_FLAGS}")
+
+include(CompilerWarnings)
+zide_define_warnings(project_warnings ${@UPPER@_STRICT})
+
+add_library(@IDENT@_core STATIC @CORE_SRCS@)
+add_library(@IDENT@::core ALIAS @IDENT@_core)
+target_include_directories(@IDENT@_core PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
+target_link_libraries(@IDENT@_core PRIVATE project_warnings)
+
+add_executable(@IDENT@ src/main.@EXT@)
+target_link_libraries(@IDENT@ PRIVATE @IDENT@::core project_warnings)
+
+include(GNUInstallDirs)
+install(TARGETS @IDENT@ RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(@UPPER@_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
+
+if(@UPPER@_BUILD_BENCHMARKS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/CMakeLists.txt")
+  add_subdirectory(benchmarks)
+endif()
+EOF
+
+  put_tpl "$ROOT/cmake/CompilerWarnings.cmake" text 644 <<'EOF'
+# Defines an INTERFACE target carrying the project's warning flags.
+#   zide_define_warnings(<target> <strict:ON|OFF>)
+function(zide_define_warnings target strict)
+  add_library(${target} INTERFACE)
+  if(MSVC)
+    target_compile_options(${target} INTERFACE /W4)
+    if(strict)
+      target_compile_options(${target} INTERFACE /WX)
+    endif()
+  else()
+    target_compile_options(${target} INTERFACE -Wall -Wextra -Wpedantic)
+    if(strict)
+      target_compile_options(${target} INTERFACE -Werror)
+    endif()
+  endif()
+endfunction()
+EOF
+
+  put_tpl "$ROOT/CMakePresets.json" json 644 <<'EOF'
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      @GENERATOR_LINE@
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "@UPPER@_STRICT": "@STRICT_JSON@"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Debug",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + AddressSanitizer",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address"
+      }
+    },
+    {
+      "name": "ubsan",
+      "displayName": "Debug + UndefinedBehaviorSanitizer",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + ThreadSanitizer",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } }
+  ]
+}
+EOF
+}
+
+init_cmake_sources() {
+  case $LANG_SEL in
+    c)
+      put_tpl "$ROOT/include/$IDENT/$IDENT.h" text 644 <<'EOF'
+#ifndef @UPPER@_H
+#define @UPPER@_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Returns a + b. */
+int @IDENT@_add(int a, int b);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* @UPPER@_H */
+EOF
+      put_tpl "$ROOT/src/$IDENT.c" text 644 <<'EOF'
+#include <@HDR@>
+
+int @IDENT@_add(int a, int b) { return a + b; }
+EOF
+      put_tpl "$ROOT/src/main.c" text 644 <<'EOF'
+#include <stdio.h>
+
+#include <@HDR@>
+
+int main(void) {
+    const int sum = @ADD@(2, 3);
+    printf("@IDENT@: 2 + 3 = %d\n", sum);
+    return sum == 5 ? 0 : 1;
+}
+EOF
+      ;;
+    cpp)
+      put_tpl "$ROOT/include/$IDENT/$IDENT.hpp" text 644 <<'EOF'
+#pragma once
+
+namespace @IDENT@ {
+
+/// Returns a + b.
+[[nodiscard]] int add(int a, int b) noexcept;
+
+}  // namespace @IDENT@
+EOF
+      put_tpl "$ROOT/src/$IDENT.cpp" text 644 <<'EOF'
+#include <@HDR@>
+
+namespace @IDENT@ {
+
+int add(int a, int b) noexcept { return a + b; }
+
+}  // namespace @IDENT@
+EOF
+      ;;
+    mixed)
+      put_tpl "$ROOT/include/$IDENT/${IDENT}_c.h" text 644 <<'EOF'
+#ifndef @UPPER@_C_H
+#define @UPPER@_C_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* C API: returns a + b. */
+int @IDENT@_c_add(int a, int b);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* @UPPER@_C_H */
+EOF
+      put_tpl "$ROOT/src/${IDENT}_c.c" text 644 <<'EOF'
+#include <@IDENT@/@IDENT@_c.h>
+
+int @IDENT@_c_add(int a, int b) { return a + b; }
+EOF
+      put_tpl "$ROOT/include/$IDENT/$IDENT.hpp" text 644 <<'EOF'
+#pragma once
+
+namespace @IDENT@ {
+
+/// C++ facade over the C implementation.
+[[nodiscard]] int add(int a, int b) noexcept;
+
+}  // namespace @IDENT@
+EOF
+      put_tpl "$ROOT/src/$IDENT.cpp" text 644 <<'EOF'
+#include <@HDR@>
+
+#include <@IDENT@/@IDENT@_c.h>
+
+namespace @IDENT@ {
+
+int add(int a, int b) noexcept { return @IDENT@_c_add(a, b); }
+
+}  // namespace @IDENT@
+EOF
+      ;;
+  esac
+  if [[ $LANG_SEL != c ]]; then
+    put_tpl "$ROOT/src/main.cpp" text 644 <<'EOF'
+#include <cstdio>
+
+#include <@HDR@>
+
+int main() {
+    const int sum = @ADD@(2, 3);
+    std::printf("@IDENT@: 2 + 3 = %d\n", sum);
+    return sum == 5 ? 0 : 1;
+}
+EOF
+  fi
+}
+
+init_cmake_tests() {
+  local fw=$TESTFW block
+  if [[ $TESTFW == none ]]; then
+    put_tpl "$ROOT/tests/CMakeLists.txt" text 644 <<'EOF'
+# Tests disabled at scaffold time (--test none). Add targets here and register
+# them with add_test(); `ctest --preset dev` will then pick them up.
+EOF
+    return 0
+  fi
+  if [[ $LANG_SEL == c ]]; then fw=ctest; fi
+  case $fw in
+    catch2) block='find_package(Catch2 3 QUIET CONFIG)
+if(Catch2_FOUND)
+  target_compile_definitions(@IDENT@_tests PRIVATE ZIDE_USE_CATCH2=1)
+  target_link_libraries(@IDENT@_tests PRIVATE Catch2::Catch2WithMain)
+  message(STATUS "tests: using system Catch2 ${Catch2_VERSION}")
+else()
+  message(STATUS "tests: Catch2 not installed; using the built-in smoke test")
+endif()' ;;
+    doctest) block='find_package(doctest QUIET CONFIG)
+if(doctest_FOUND)
+  target_compile_definitions(@IDENT@_tests PRIVATE ZIDE_USE_DOCTEST=1)
+  target_link_libraries(@IDENT@_tests PRIVATE doctest::doctest)
+  message(STATUS "tests: using system doctest ${doctest_VERSION}")
+else()
+  message(STATUS "tests: doctest not installed; using the built-in smoke test")
+endif()' ;;
+    gtest) block='find_package(GTest QUIET CONFIG)
+if(NOT GTest_FOUND)
+  find_package(GTest QUIET)
+endif()
+if(GTest_FOUND)
+  target_compile_definitions(@IDENT@_tests PRIVATE ZIDE_USE_GTEST=1)
+  target_link_libraries(@IDENT@_tests PRIVATE GTest::gtest_main)
+  message(STATUS "tests: using system GoogleTest")
+else()
+  message(STATUS "tests: GoogleTest not installed; using the built-in smoke test")
+endif()' ;;
+    *) block='message(STATUS "tests: dependency-free CTest smoke test")' ;;
+  esac
+  TOK[TESTFW_BLOCK]=${block//@IDENT@/$IDENT}
+  put_tpl "$ROOT/tests/CMakeLists.txt" text 644 <<'EOF'
+add_executable(@IDENT@_tests test_main.@EXT@)
+target_link_libraries(@IDENT@_tests PRIVATE @IDENT@::core project_warnings)
+
+@TESTFW_BLOCK@
+
+add_test(NAME @IDENT@.unit COMMAND @IDENT@_tests)
+EOF
+  if [[ $LANG_SEL == c ]]; then
+    put_tpl "$ROOT/tests/test_main.c" text 644 <<'EOF'
+#include <stdio.h>
+
+#include <@HDR@>
+
+static int failures = 0;
+
+#define CHECK_EQ(actual, expected)                                          \
+    do {                                                                    \
+        if ((actual) != (expected)) {                                       \
+            fprintf(stderr, "FAIL %s:%d: %s != %s\n", __FILE__, __LINE__,   \
+                    #actual, #expected);                                    \
+            ++failures;                                                     \
+        }                                                                   \
+    } while (0)
+
+int main(void) {
+    CHECK_EQ(@ADD@(0, 0), 0);
+    CHECK_EQ(@ADD@(2, 3), 5);
+    CHECK_EQ(@ADD@(-1, 1), 0);
+    if (failures == 0) puts("@IDENT@: all tests passed");
+    return failures == 0 ? 0 : 1;
+}
+EOF
+  else
+    put_tpl "$ROOT/tests/test_main.cpp" text 644 <<'EOF'
+#if defined(ZIDE_USE_CATCH2)
+#include <catch2/catch_test_macros.hpp>
+
+#include <@HDR@>
+
+TEST_CASE("add combines integers", "[add]") {
+    REQUIRE(@ADD@(0, 0) == 0);
+    REQUIRE(@ADD@(2, 3) == 5);
+    REQUIRE(@ADD@(-1, 1) == 0);
+}
+#elif defined(ZIDE_USE_DOCTEST)
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
+
+#include <@HDR@>
+
+TEST_CASE("add combines integers") {
+    CHECK(@ADD@(0, 0) == 0);
+    CHECK(@ADD@(2, 3) == 5);
+    CHECK(@ADD@(-1, 1) == 0);
+}
+#elif defined(ZIDE_USE_GTEST)
+#include <gtest/gtest.h>
+
+#include <@HDR@>
+
+TEST(Add, CombinesIntegers) {
+    EXPECT_EQ(@ADD@(0, 0), 0);
+    EXPECT_EQ(@ADD@(2, 3), 5);
+    EXPECT_EQ(@ADD@(-1, 1), 0);
+}
+#else
+#include <cstdio>
+
+#include <@HDR@>
+
+namespace {
+int failures = 0;
+
+void check(bool ok, const char* expr, int line) {
+    if (!ok) {
+        std::fprintf(stderr, "FAIL line %d: %s\n", line, expr);
+        ++failures;
+    }
+}
+}  // namespace
+
+#define CHECK_EQ(actual, expected) check((actual) == (expected), #actual " == " #expected, __LINE__)
+
+int main() {
+    CHECK_EQ(@ADD@(0, 0), 0);
+    CHECK_EQ(@ADD@(2, 3), 5);
+    CHECK_EQ(@ADD@(-1, 1), 0);
+    if (failures == 0) std::puts("@IDENT@: all tests passed");
+    return failures == 0 ? 0 : 1;
+}
+#endif
+EOF
+  fi
+}
+
+init_cmake_bench() {
+  ((BENCH)) || return 0
+  put_tpl "$ROOT/benchmarks/CMakeLists.txt" text 644 <<'EOF'
+add_executable(@IDENT@_bench bench_main.@EXT@)
+target_link_libraries(@IDENT@_bench PRIVATE @IDENT@::core project_warnings)
+EOF
+  if [[ $LANG_SEL == c ]]; then
+    put_tpl "$ROOT/benchmarks/bench_main.c" text 644 <<'EOF'
+#include <stdio.h>
+#include <time.h>
+
+#include <@HDR@>
+
+int main(void) {
+    enum { iterations = 50000000 };
+    long long acc = 0;
+    const clock_t start = clock();
+    for (int i = 0; i < iterations; ++i) acc += @ADD@(i, 1);
+    const double secs = (double)(clock() - start) / CLOCKS_PER_SEC;
+    printf("@IDENT@ add: %d iterations in %.3f s (checksum %lld)\n", (int)iterations, secs, acc);
+    return 0;
+}
+EOF
+  else
+    put_tpl "$ROOT/benchmarks/bench_main.cpp" text 644 <<'EOF'
+#include <chrono>
+#include <cstdio>
+
+#include <@HDR@>
+
+int main() {
+    constexpr int iterations = 50000000;
+    long long acc = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) acc += @ADD@(i, 1);
+    const std::chrono::duration<double> secs = std::chrono::steady_clock::now() - start;
+    std::printf("@IDENT@ add: %d iterations in %.3f s (checksum %lld)\n", iterations, secs.count(), acc);
+    return 0;
+}
+EOF
+  fi
+}
+
+init_cmake_scripts() {
+  put_tpl "$ROOT/scripts/build.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# Configure + build + (re)link compile_commands.json.   usage: scripts/build.sh [preset]
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+preset="${1:-dev}"
+cmake --preset "$preset"
+cmake --build --preset "$preset"
+ln -sfn "build/$preset/compile_commands.json" compile_commands.json
+EOF
+  put_tpl "$ROOT/scripts/run.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# Build and run.   usage: scripts/run.sh [preset] [-- program args...]
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+preset="${1:-dev}"
+shift || true
+if [[ "${1:-}" == "--" ]]; then shift; fi
+cmake --preset "$preset" >/dev/null
+cmake --build --preset "$preset"
+exec "./build/$preset/@IDENT@" "$@"
+EOF
+  put_tpl "$ROOT/scripts/format.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# Format all C/C++ sources with clang-format.   usage: scripts/format.sh [--check]
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+if ! command -v clang-format >/dev/null 2>&1; then
+  echo "clang-format is not installed" >&2
+  exit 1
+fi
+mapfile -d '' -t files < <(find include src tests benchmarks -type f \
+  \( -name '*.c' -o -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hpp' \) \
+  -print0 2>/dev/null | sort -z)
+if ((${#files[@]} == 0)); then
+  echo "no sources found"
+  exit 0
+fi
+if [[ "${1:-}" == "--check" ]]; then
+  clang-format --dry-run --Werror "${files[@]}"
+else
+  clang-format -i "${files[@]}"
+  echo "formatted ${#files[@]} file(s)"
+fi
+EOF
+  put_tpl "$ROOT/scripts/sanitize.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# Build and test under sanitizers.   usage: scripts/sanitize.sh [asan|ubsan|tsan|all]
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+which="${1:-asan}"
+case "$which" in
+  asan | ubsan | tsan) presets=("$which") ;;
+  all) presets=(asan ubsan tsan) ;;
+  *) echo "usage: $0 [asan|ubsan|tsan|all]" >&2; exit 2 ;;
+esac
+for p in "${presets[@]}"; do
+  echo "==> $p"
+  cmake --preset "$p"
+  cmake --build --preset "$p"
+  ctest --preset "$p"
+done
+EOF
+}
+
+init_cmake_zed() {
+  TASKS=() DEBUGS=()
+  tasks_cmake dev build/dev 1 "$IDENT"
+  add_task "build: release" on_success cmake --build --preset release
+  add_task "sanitize: asan" "" bash scripts/sanitize.sh asan
+  add_task "format" on_success bash scripts/format.sh
+  add_debug "Debug $IDENT (CodeLLDB)" CodeLLDB "build/dev/$IDENT" build
+  add_debug "Debug $IDENT (GDB)" GDB "build/dev/$IDENT" build
+  local c=0 cpp=0
+  case $LANG_SEL in c) c=1 ;; cpp) cpp=1 ;; mixed) c=1 cpp=1 ;; esac
+  put_str "$ROOT/.zed/settings.json" json-object 644 "$(zed_settings "$c" "$cpp" 0)"
+  put_str "$ROOT/.zed/tasks.json" json-array 644 "$(emit_array "${TASKS[@]}")"
+  put_str "$ROOT/.zed/debug.json" json-array 644 "$(emit_array "${DEBUGS[@]}")"
+  put_str "$ROOT/.clangd" text 644 "$(clangd_text build/dev)"
+  put_str "$ROOT/.clang-format" text 644 "$(clang_format_text)"
+  put_str "$ROOT/.clang-tidy" text 644 "$(clang_tidy_text)"
+}
+
+init_project_readme() {
+  put_tpl "$ROOT/README.md" text 644 <<'EOF'
+# @NAME@
+
+Scaffolded by [zide](https://zed.dev) - language: `@LANG@`, tests: `@TESTFW@`, strict warnings: `@STRICT_ONOFF@`.
+
+## Quick start
+
+```sh
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+./build/dev/@IDENT@
+```
+
+Presets: `dev`, `release`, `asan`, `ubsan`, `tsan`. Helper scripts live in `scripts/`
+(`build.sh`, `run.sh`, `format.sh [--check]`, `sanitize.sh [asan|ubsan|tsan|all]`).
+
+## Layout
+
+```
+include/@IDENT@/   public headers
+src/               implementation + main
+tests/             ctest targets
+benchmarks/        optional (enabled with zide --benchmarks)
+cmake/             CMake modules
+scripts/           build / run / format / sanitize
+third_party/       dependency notes (FetchContent examples; nothing is fetched)
+.zed/              Zed settings, tasks and debug profiles
+```
+
+## Zed
+
+Open the folder in Zed. `clangd` reads `.clangd`, which points at `build/dev/compile_commands.json`
+(run `cmake --preset dev` once). Use `task: spawn` for build/test/run/format and the debugger panel
+for `CodeLLDB` or `GDB` profiles.
+
+## Tests
+
+`@TESTFW@` is used when the framework is installed system-wide and CMake can find it; otherwise the
+same target falls back to a dependency-free smoke test, so `ctest` always works offline.
+EOF
+  put_tpl "$ROOT/third_party/README.md" text 644 <<'EOF'
+# third_party
+
+Declare external dependencies here or in `cmake/`. zide never downloads anything; for example:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(doctest
+  GIT_REPOSITORY https://github.com/doctest/doctest.git
+  GIT_TAG v2.4.11)
+FetchContent_MakeAvailable(doctest)
+```
+EOF
+  if ((BENCH)); then
+    :
+  fi
+}
+
+init_cmake() {
+  mk_dir "$ROOT/include/$IDENT" "$ROOT/src" "$ROOT/tests" "$ROOT/cmake" "$ROOT/scripts" "$ROOT/third_party" "$ROOT/.zed"
+  if ((BENCH)); then mk_dir "$ROOT/benchmarks"; fi
+  init_cmake_project
+  init_cmake_sources
+  init_cmake_tests
+  init_cmake_bench
+  init_cmake_scripts
+  init_cmake_zed
+  init_project_readme
+  put_block "$ROOT/.gitignore" "$(gitignore_body)"
+}
+
+init_rust() {
+  mk_dir "$ROOT/src" "$ROOT/tests" "$ROOT/scripts" "$ROOT/.zed"
+  local lints=""
+  if [[ $STRICT == 1 ]]; then
+    lints='
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+'
+  fi
+  TOK[LINTS]=$lints
+  put_tpl "$ROOT/Cargo.toml" text 644 <<'EOF'
+[package]
+name = "@CRATE@"
+version = "0.1.0"
+edition = "2021"
+description = "@NAME@"
+
+[dependencies]
+@LINTS@
+[profile.release]
+lto = "thin"
+codegen-units = 1
+EOF
+  put_tpl "$ROOT/src/lib.rs" text 644 <<'EOF'
+/// Returns `a + b`.
+#[must_use]
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_integers() {
+        assert_eq!(add(0, 0), 0);
+        assert_eq!(add(2, 3), 5);
+        assert_eq!(add(-1, 1), 0);
+    }
+}
+EOF
+  put_tpl "$ROOT/src/main.rs" text 644 <<'EOF'
+fn main() {
+    println!("@CRATE@: 2 + 3 = {}", @IDENT@::add(2, 3));
+}
+EOF
+  put_tpl "$ROOT/tests/integration.rs" text 644 <<'EOF'
+#[test]
+fn add_is_commutative() {
+    assert_eq!(@IDENT@::add(2, 3), @IDENT@::add(3, 2));
+}
+EOF
+  put_str "$ROOT/rustfmt.toml" text 644 'edition = "2021"
+max_width = 100'
+  TASKS=() DEBUGS=()
+  tasks_cargo
+  add_debug "Debug $CRATE (CodeLLDB)" CodeLLDB "target/debug/$CRATE" build
+  add_debug "Debug $CRATE (GDB)" GDB "target/debug/$CRATE" build
+  put_str "$ROOT/.zed/settings.json" json-object 644 "$(zed_settings 0 0 1)"
+  put_str "$ROOT/.zed/tasks.json" json-array 644 "$(emit_array "${TASKS[@]}")"
+  put_str "$ROOT/.zed/debug.json" json-array 644 "$(emit_array "${DEBUGS[@]}")"
+  put_tpl "$ROOT/scripts/build.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cargo build --all-targets
+cargo test
+EOF
+  put_tpl "$ROOT/scripts/run.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+exec cargo run -- "$@"
+EOF
+  put_tpl "$ROOT/scripts/format.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# usage: scripts/format.sh [--check]
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+if [[ "${1:-}" == "--check" ]]; then cargo fmt --all -- --check; else cargo fmt --all; fi
+EOF
+  put_tpl "$ROOT/scripts/sanitize.sh" text 755 <<'EOF'
+#!/usr/bin/env bash
+# Lints with clippy, then runs the tests under Miri when the nightly component is installed.
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cargo clippy --all-targets -- -D warnings
+if cargo +nightly miri --version >/dev/null 2>&1; then
+  cargo +nightly miri test
+else
+  echo "miri unavailable: rustup toolchain install nightly && rustup +nightly component add miri" >&2
+fi
+EOF
+  put_tpl "$ROOT/README.md" text 644 <<'EOF'
+# @NAME@
+
+Rust crate scaffolded by zide.
+
+```sh
+cargo build
+cargo test
+cargo run
+```
+
+Helper scripts are in `scripts/`; Zed tasks and CodeLLDB/GDB debug profiles are in `.zed/`.
+EOF
+  put_block "$ROOT/.gitignore" "/target
+*.bak.*"
+}
+
+init_license() {
+  [[ $LICENSE_SEL == none ]] && return 0
+  put_str "$ROOT/LICENSE" text 644 "$(emit_license "$LICENSE_SEL" "$YEAR" "$AUTHOR")"
+}
+
+init_configure() {
+  if [[ $LANG_SEL == rust ]] || ((NO_CONFIGURE)); then return 0; fi
+  if ! have cmake; then
+    warn "cmake not found; skipped configure. $(install_hint cmake)"
+    return 0
+  fi
+  if ((DRY_RUN)); then
+    dry "cmake --preset dev (generate compile_commands.json)"
+    return 0
+  fi
+  if try_run "cmake --preset dev (exporting compile commands for clangd)" \
+    bash -c 'cd -- "$1" && cmake --preset dev' _ "$ROOT"; then
+    if [[ -f $ROOT/build/dev/compile_commands.json ]]; then link_compdb build/dev/compile_commands.json; fi
+  fi
+  return 0
+}
+
+init_git() {
+  local -a idc=()
+  ((GIT)) || return 0
+  if ! have git; then
+    warn "git not found; skipped repository setup. $(install_hint git)"
+    return 0
+  fi
+  if ((DRY_RUN)); then
+    dry "git init + initial commit"
+    return 0
+  fi
+  if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "already inside a git work tree; not creating a repository or commit"
+    return 0
+  fi
+  git -C "$ROOT" init -q -b main 2>/dev/null || git -C "$ROOT" init -q
+  git -C "$ROOT" add -A
+  git -C "$ROOT" config --get user.name >/dev/null 2>&1 || idc+=(-c user.name=zide)
+  git -C "$ROOT" config --get user.email >/dev/null 2>&1 || idc+=(-c user.email=zide@localhost)
+  if git -C "$ROOT" "${idc[@]}" commit -q -m "chore: initial scaffold (zide $ZIDE_VERSION)"; then
+    ok "git repository initialised with an initial commit"
+  else
+    warn "initial commit failed; run 'git commit' manually"
+  fi
+}
+
+init_bare_remote() {
+  [[ -n $BARE_REMOTE ]] || return 0
+  local remote
+  remote=$(safe_path "$BARE_REMOTE")
+  if [[ -e $remote ]]; then
+    [[ -d $remote ]] || die "$E_REFUSED" "bare remote path is not a directory: $remote"
+    if [[ -n $(find "$remote" -mindepth 1 -maxdepth 1 -print -quit) ]] && ((!FORCE)); then
+      die "$E_REFUSED" "bare remote path is not empty (use --force): $remote"
+    fi
+  fi
+  if ((DRY_RUN)); then
+    dry "git init --bare $remote + post-receive hook"
+    return 0
+  fi
+  git init -q --bare "$remote"
+  mk_tmp
+  cat >"$TMP_LAST" <<'EOF'
+#!/usr/bin/env bash
+# Stub post-receive hook installed by zide. Add CI triggers or notifications here.
+set -Eeuo pipefail
+while read -r oldrev newrev refname; do
+  printf 'received %s: %s -> %s\n' "$refname" "$oldrev" "$newrev" >&2
+done
+EOF
+  install -m 755 -- "$TMP_LAST" "$remote/hooks/post-receive"
+  if [[ -d $ROOT/.git ]] && ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$ROOT" remote add origin "$remote"
+  fi
+  ok "bare remote ready: $remote"
+}
+
+cmd_init() {
+  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "init: missing <project-path>"
+  ROOT=$(safe_path "$POS_PATH")
+  if [[ -e $ROOT && ! -d $ROOT ]]; then die "$E_REFUSED" "target exists and is not a directory: $ROOT"; fi
+  init_resolve
+  init_tokens
+  if [[ -d $ROOT && -n $(find "$ROOT" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    info "target is not empty: existing files are preserved (differing ones are kept unless --force)"
+  fi
+  info "scaffolding '$INIT_NAME' ($LANG_SEL) in $ROOT"
+  if [[ $LANG_SEL == rust ]]; then
+    need_tool cargo 1
+    need_tool rust-analyzer 1
+  else
+    need_tool cmake 1 "build"
+    need_tool ninja 0 "default generator; falls back to Unix Makefiles"
+    need_tool clangd 1 "language server"
+    need_tool clang-format 0
+    need_tool jq 0 "JSON validation"
+    if [[ $LANG_SEL == c && $TESTFW =~ ^(catch2|doctest|gtest)$ ]]; then
+      warn "C projects use the built-in CTest smoke test; '$TESTFW' ignored"
+    fi
+  fi
+  mk_dir "$ROOT"
+  if [[ $LANG_SEL == rust ]]; then init_rust; else init_cmake; fi
+  init_license
+  if [[ $LANG_SEL != rust ]]; then init_configure; fi
+  init_git
+  init_bare_remote
+  ok "scaffold finished"
+  print_report "Scaffold report"
+  if [[ $LANG_SEL == rust ]]; then
+    printf '\nNext steps:\n  cd %q && cargo test && cargo run && zed .\n' "$ROOT"
+  else
+    printf '\nNext steps:\n  cd %q\n  cmake --preset dev && cmake --build --preset dev && ctest --preset dev\n  zed .\n' "$ROOT"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+$PROG $ZIDE_VERSION - IDE-grade Zed setup for native (C / C++ / Rust) projects
+
+USAGE
+  $PROG                                   interactive wizard (when run in a terminal)
+  $PROG -i [adopt|init] [path]            interactive wizard, optionally pre-selecting the mode/path
+  $PROG [options] adopt  <project-path>   retrofit an existing project, non-destructively
+  $PROG [options] init   <project-path>   scaffold a new project that builds and tests out of the box
+  $PROG doctor                            show toolchain status and install hints
+
+GLOBAL OPTIONS
+  -v, --verbose          verbose logging
+  -n, --dry-run          show what would change; write and run nothing
+  -f, --force            replace files that differ from the templates (backed up as *.bak.<UTC>)
+  -i, --interactive      guided wizard: menus, questions, summary, preview, apply
+  -y, --yes              never prompt; use defaults for anything not given
+      --no-color         disable colours (NO_COLOR is honoured too)
+  -h, --help             this help
+      --version          print the version
+
+ADOPT OPTIONS
+      --no-cmake         never generate a CMakeLists.txt
+      --no-configure     do not run cmake/meson/bear/compiledb
+      --std N            C++ (17|20|23) / C (11|17|23) standard for a generated CMakeLists.txt
+      --style S          clang-format base style: llvm (default) | mozilla | google
+
+INIT OPTIONS (anything omitted is asked interactively, or defaulted with -y / no TTY)
+      --name NAME        project name (default: directory name)
+      --lang L           c | cpp | rust | c-cpp-mixed                    (default: cpp)
+      --std N | --c-std N   C++ standard 17|20|23 (default 20) / C standard 11|17|23 (default 17)
+      --test T           ctest | catch2 | doctest | gtest | none         (default: ctest)
+                         catch2/doctest/gtest are used only if installed system-wide
+      --license L        mit | apache2 | bsd3 | gpl3 | none              (default: mit)
+      --author NAME      license holder (default: git user.name)
+      --year YYYY        license year (default: current)
+      --strict           -Wall -Wextra -Wpedantic -Werror (clippy/rustc deny for Rust)
+      --benchmarks       add benchmarks/ (dependency-free)
+      --style S          clang-format base style: llvm | mozilla | google
+      --generator G      auto | ninja | make                              (default: auto)
+      --no-git           skip git init and the initial commit
+      --bare-remote DIR  create a bare repo at DIR with a post-receive stub; add it as 'origin'
+      --no-configure     skip the initial 'cmake --preset dev'
+
+EXAMPLES
+  $PROG --dry-run -v adopt ~/src/legacy
+  $PROG adopt ~/src/mylib --style mozilla
+  $PROG init ~/src/fastcalc --lang cpp --std 20 --strict --test doctest
+  $PROG init ~/src/packetd --lang c --std 17 --license apache2 --benchmarks
+  $PROG init ./bridge --lang c-cpp-mixed -y
+
+EXIT CODES
+  0 ok   1 failure   2 usage   3 invalid generated JSON   4 refused unsafe operation
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Interactive wizard (zide -i, or just `zide` in a terminal)
+# --------------------------------------------------------------------------
+INTERACTIVE=0
+RUN_RC=0
+WIZ_VARS=(LANG_SEL INIT_NAME TESTFW LICENSE_SEL AUTHOR YEAR STRICT BENCH GIT STYLE C_STD CXX_STD STD_SET NO_CMAKE NO_CONFIGURE POS_PATH BARE_REMOTE FORCE)
+declare -A WIZ_SNAP=()
+
+wiz_snapshot() {
+  local v
+  for v in "${WIZ_VARS[@]}"; do WIZ_SNAP[$v]=${!v}; done
+}
+wiz_restore() {
+  local v
+  for v in "${WIZ_VARS[@]}"; do printf -v "$v" '%s' "${WIZ_SNAP[$v]}"; done
+}
+
+ui_banner() {
+  printf '\n%s%szide %s%s  %sZed IDE setup wizard%s\n' "$C_BOLD" "$C_CYAN" "$ZIDE_VERSION" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  printf '%s  Up/Down or j/k move, Enter selects, 1-9 jump to an item, Ctrl-C quits.%s\n' "$C_DIM" "$C_RESET" >&2
+}
+ui_section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
+
+# ui_input <var> <question> <default>   (readline editing, Tab completes paths)
+ui_input() {
+  local -n _ui_ref=$1
+  local ans=""
+  printf '%s?%s %s\n' "$C_CYAN" "$C_RESET" "$2" >&2
+  read -r -e -p "  > " -i "$3" ans || die 130 "input closed"
+  _ui_ref=${ans:-$3}
+}
+
+# ui_confirm <question> <default y|n>   returns 0 for yes
+ui_confirm() {
+  local q=$1 def=${2:-y} hint ans
+  if [[ $def == y ]]; then hint="Y/n"; else hint="y/N"; fi
+  while true; do
+    printf '%s?%s %s [%s] ' "$C_CYAN" "$C_RESET" "$q" "$hint" >&2
+    IFS= read -rsn1 ans || die 130 "input closed"
+    case ${ans,,} in
+      y) printf 'yes\n' >&2; return 0 ;;
+      n) printf 'no\n' >&2; return 1 ;;
+      '')
+        if [[ $def == y ]]; then printf 'yes\n' >&2; return 0; fi
+        printf 'no\n' >&2
+        return 1
+        ;;
+    esac
+    printf '\r\033[K' >&2
+  done
+}
+
+# ui_choose <var> <title> <default-value> "value|label" ...
+ui_choose() {
+  local -n _ui_ref=$1
+  local title=$2 def=$3 o i sel=0 n key rest=""
+  local -a vals=() labels=()
+  shift 3
+  for o in "$@"; do
+    vals+=("${o%%|*}")
+    labels+=("${o#*|}")
+  done
+  n=${#vals[@]}
+  for ((i = 0; i < n; i++)); do
+    if [[ ${vals[i]} == "$def" ]]; then sel=$i; fi
+  done
+  printf '%s?%s %s%s%s\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$title" "$C_RESET" >&2
+  printf '\033[?25l' >&2
+  while true; do
+    for ((i = 0; i < n; i++)); do
+      if ((i == sel)); then
+        printf '  %s> %s%s\033[K\n' "$C_CYAN" "${labels[i]}" "$C_RESET" >&2
+      else
+        printf '    %s\033[K\n' "${labels[i]}" >&2
+      fi
+    done
+    IFS= read -rsn1 key || { printf '\033[?25h' >&2; die 130 "input closed"; }
+    if [[ $key == $'\033' ]]; then
+      rest=""
+      read -rsn2 -t 0.05 rest || true
+      key=$rest
+    fi
+    case $key in
+      '[A' | k) sel=$(((sel - 1 + n) % n)) ;;
+      '[B' | j) sel=$(((sel + 1) % n)) ;;
+      '') break ;;
+      [1-9]) if ((key <= n)); then sel=$((key - 1)); fi ;;
+    esac
+    printf '\033[%dA' "$n" >&2
+  done
+  printf '\033[?25h\033[%dA\033[J' "$((n + 1))" >&2
+  printf '%s?%s %s %s-> %s%s\n' "$C_CYAN" "$C_RESET" "$title" "$C_GREEN" "${labels[sel]%%  (*}" "$C_RESET" >&2
+  _ui_ref=${vals[sel]}
+}
+
+# Run a command in a subshell so that die()/exit does not end the wizard.
+run_isolated() {
+  set +e
+  (
+    set -e
+    trap cleanup EXIT
+    "$@"
+  )
+  RUN_RC=$?
+  set -e
+  return 0
+}
+
+yesno() { if (($1)); then printf 'yes'; else printf 'no'; fi; }
+
+wiz_apply() { # <command-function> <project-root>
+  local choice
+  while true; do
+    ui_choose choice "Ready?" apply \
+      "apply|Apply now" \
+      "preview|Preview first (dry-run: nothing is written or executed)" \
+      "cancel|Cancel"
+    case $choice in
+      preview)
+        DRY_RUN=1
+        run_isolated "$1"
+        DRY_RUN=0
+        ;;
+      apply)
+        run_isolated "$1"
+        if ((RUN_RC)); then
+          err "finished with errors (exit $RUN_RC)"
+        elif have zed && ui_confirm "Open the project in Zed now?" y; then
+          (zed "$2" >/dev/null 2>&1 &)
+        fi
+        return 0
+        ;;
+      cancel)
+        info "cancelled; nothing was changed"
+        return 0
+        ;;
+    esac
+  done
+}
+
+wizard_init() {
+  local default_author
+  wiz_restore
+  ui_section "New project"
+  while true; do
+    if [[ -z $POS_PATH ]]; then ui_input POS_PATH "Project directory (created if missing)" "./my-project"; fi
+    if ROOT=$(safe_path "$POS_PATH"); then break; fi
+    POS_PATH=""
+  done
+  if [[ -d $ROOT && -n $(find "$ROOT" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    info "directory is not empty: existing files are preserved unless you allow replacing them"
+  fi
+  if [[ -z $INIT_NAME ]]; then ui_input INIT_NAME "Project name" "$(basename -- "$ROOT")"; fi
+  if [[ -z $LANG_SEL ]]; then
+    ui_choose LANG_SEL "Language" cpp \
+      "cpp|C++" "c|C" "mixed|C and C++ in one project" "rust|Rust (cargo)"
+  fi
+  LANG_SEL=$(norm_lang "$LANG_SEL") || die "$E_USAGE" "invalid language"
+  if ((!STD_SET)); then
+    case $LANG_SEL in c | mixed)
+      ui_choose C_STD "C standard" "$C_STD" "17|C17" "11|C11" "23|C23"
+      ;;
+    esac
+    case $LANG_SEL in cpp | mixed)
+      ui_choose CXX_STD "C++ standard" "$CXX_STD" "20|C++20" "17|C++17" "23|C++23"
+      ;;
+    esac
+    STD_SET=1
+  fi
+  if [[ $LANG_SEL == rust ]]; then
+    TESTFW=cargo
+  elif [[ $LANG_SEL == c ]]; then
+    TESTFW=ctest
+  elif [[ -z $TESTFW ]]; then
+    ui_choose TESTFW "Test framework" ctest \
+      "ctest|CTest smoke test (no dependencies)" \
+      "catch2|Catch2  (used only if installed system-wide)" \
+      "doctest|doctest  (used only if installed system-wide)" \
+      "gtest|GoogleTest  (used only if installed system-wide)" \
+      "none|No tests"
+  fi
+  if [[ -z $LICENSE_SEL ]]; then
+    ui_choose LICENSE_SEL "License" mit \
+      "mit|MIT" "apache2|Apache-2.0" "bsd3|BSD-3-Clause" "gpl3|GPL-3.0-or-later" "none|No license file"
+  fi
+  if [[ -z $AUTHOR ]]; then
+    default_author=$(git config --get user.name 2>/dev/null || true)
+    ui_input AUTHOR "License holder" "${default_author:-${USER:-author}}"
+  fi
+  if [[ -z $STRICT ]]; then
+    if ui_confirm "Strict warnings (-Wall -Wextra -Wpedantic -Werror / deny warnings)?" n; then STRICT=1; else STRICT=0; fi
+  fi
+  if [[ $LANG_SEL != rust ]]; then
+    if ui_confirm "Add a benchmarks/ target?" "$([[ $BENCH == 1 ]] && echo y || echo n)"; then BENCH=1; else BENCH=0; fi
+    ui_choose STYLE "clang-format style" "$STYLE" "llvm|LLVM" "google|Google" "mozilla|Mozilla"
+    if ui_confirm "Run 'cmake --preset dev' now so clangd works immediately?" "$([[ $NO_CONFIGURE == 1 ]] && echo n || echo y)"; then NO_CONFIGURE=0; else NO_CONFIGURE=1; fi
+  fi
+  if ui_confirm "Initialise a git repository with a first commit?" "$([[ $GIT == 1 ]] && echo y || echo n)"; then GIT=1; else GIT=0; fi
+  if [[ -d $ROOT ]] && ui_confirm "Replace existing files that differ from the templates? (backups are made)" "$([[ $FORCE == 1 ]] && echo y || echo n)"; then FORCE=1; else FORCE=0; fi
+
+  ui_section "Summary"
+  {
+    printf '  %-12s %s\n' "directory" "$ROOT" "name" "$INIT_NAME" "language" "$LANG_SEL"
+    if [[ $LANG_SEL != rust ]]; then
+      printf '  %-12s C++%s / C%s\n' "standard" "$CXX_STD" "$C_STD"
+      printf '  %-12s %s\n' "tests" "$TESTFW" "format" "$STYLE"
+    fi
+    printf '  %-12s %s\n' "license" "$LICENSE_SEL" "strict" "$(yesno "$STRICT")" "git" "$(yesno "$GIT")"
+  } >&2
+  wiz_apply cmd_init "$ROOT"
+}
+
+wizard_adopt() {
+  wiz_restore
+  ui_section "Adopt an existing project"
+  while true; do
+    if [[ -z $POS_PATH ]]; then ui_input POS_PATH "Path to the project" "."; fi
+    if ROOT=$(safe_path "$POS_PATH") && [[ -d $ROOT ]]; then break; fi
+    err "not a directory: $POS_PATH"
+    POS_PATH=""
+  done
+  scan_files
+  detect_languages
+  detect_builds
+  info "found: languages = $(langs_label); build systems = ${BUILDS[*]:-none}"
+  if ((!DETECT_C && !DETECT_CPP && !DETECT_RUST)); then
+    err "no C, C++ or Rust sources here; nothing to adopt"
+    return 0
+  fi
+  if ((DETECT_C || DETECT_CPP)); then
+    if ((${#BUILDS[@]} == 0)); then
+      if ui_confirm "No build system found. Generate a CMakeLists.txt from the sources?" y; then NO_CMAKE=0; else NO_CMAKE=1; fi
+      if ((!NO_CMAKE && !STD_SET)); then
+        if ((DETECT_CPP)); then ui_choose CXX_STD "C++ standard for the generated CMakeLists.txt" "$CXX_STD" "20|C++20" "17|C++17" "23|C++23"; fi
+        if ((DETECT_C)); then ui_choose C_STD "C standard for the generated CMakeLists.txt" "$C_STD" "17|C17" "11|C11" "23|C23"; fi
+      fi
+    fi
+    ui_choose STYLE "clang-format style (an existing .clang-format is never touched)" "$STYLE" \
+      "llvm|LLVM" "google|Google" "mozilla|Mozilla"
+    if ui_confirm "Run the build system to generate compile_commands.json now?" "$([[ $NO_CONFIGURE == 1 ]] && echo n || echo y)"; then NO_CONFIGURE=0; else NO_CONFIGURE=1; fi
+  fi
+  if ui_confirm "Replace files that differ from the templates? (No = keep yours and merge .zed/*.json)" "$([[ $FORCE == 1 ]] && echo y || echo n)"; then FORCE=1; else FORCE=0; fi
+  ui_section "Summary"
+  printf '  %-12s %s\n  %-12s %s\n  %-12s %s\n  %-12s %s\n' \
+    "project" "$ROOT" "languages" "$(langs_label)" "build" "${BUILDS[*]:-none}" "overwrite" "$(yesno "$FORCE")" >&2
+  wiz_apply cmd_adopt "$ROOT"
+}
+
+cmd_wizard() {
+  local action=$POS_CMD
+  [[ -t 0 && -t 2 ]] || die "$E_USAGE" "interactive mode needs a terminal"
+  YES=1
+  wiz_snapshot
+  ui_banner
+  while true; do
+    if [[ -z $action ]]; then
+      printf '\n' >&2
+      ui_choose action "What would you like to do?" init \
+        "init|Create a new project  (builds and tests out of the box)" \
+        "adopt|Adopt an existing project  (Zed + clangd + tasks + debug)" \
+        "doctor|Check my toolchain" \
+        "quit|Quit"
+    fi
+    case $action in
+      init) wizard_init ;;
+      adopt) wizard_adopt ;;
+      doctor) cmd_doctor ;;
+      quit) return 0 ;;
+      *) die "$E_USAGE" "unknown command: $action" ;;
+    esac
+    action=""
+    printf '\n' >&2
+    if ! ui_confirm "Do something else?" n; then return 0; fi
+  done
+}
+
+POS_CMD="" POS_PATH=""
+parse_args() {
+  local -a args=("$@")
+  local i=0 a v eq pos=0 rest=0
+  while ((i < ${#args[@]})); do
+    a=${args[i]}
+    i=$((i + 1))
+    if ((rest)) || [[ $a != -* ]]; then
+      pos=$((pos + 1))
+      case $pos in
+        1) POS_CMD=$a ;;
+        2) POS_PATH=$a ;;
+        *) die "$E_USAGE" "unexpected argument: $a" ;;
+      esac
+      continue
+    fi
+    eq=0 v=""
+    if [[ $a == --*=* ]]; then
+      v=${a#*=} a=${a%%=*} eq=1
+    fi
+    case $a in
+      --) rest=1 ;;
+      -h | --help) usage; exit 0 ;;
+      --version) printf '%s %s\n' "$PROG" "$ZIDE_VERSION"; exit 0 ;;
+      -v | --verbose) VERBOSE=1 ;;
+      -n | --dry-run) DRY_RUN=1 ;;
+      -f | --force) FORCE=1 ;;
+      -y | --yes) YES=1 ;;
+      -i | --interactive) INTERACTIVE=1 ;;
+      --no-color) COLOR=never ;;
+      --no-cmake) NO_CMAKE=1 ;;
+      --no-configure) NO_CONFIGURE=1 ;;
+      --strict) STRICT=1 ;;
+      --benchmarks) BENCH=1 ;;
+      --no-bench) BENCH=0 ;;
+      --git) GIT=1 ;;
+      --no-git) GIT=0 ;;
+      --name | --lang | --language | --std | --c-std | --test | --test-framework | --license | --author | --year | --style | --generator | --bare-remote | --build | --build-system)
+        if ((!eq)); then
+          ((i < ${#args[@]})) || die "$E_USAGE" "missing value for $a"
+          v=${args[i]}
+          i=$((i + 1))
+        fi
+        case $a in
+          --name) INIT_NAME=$v ;;
+          --lang | --language) LANG_SEL=$v ;;
+          --test | --test-framework) TESTFW=$v ;;
+          --license) LICENSE_SEL=$v ;;
+          --author) AUTHOR=$v ;;
+          --year) YEAR=$v ;;
+          --bare-remote) BARE_REMOTE=$v ;;
+          --build | --build-system)
+            case ${v,,} in cmake | cargo) ;; *) die "$E_USAGE" "unsupported build system: $v (cmake|cargo)" ;; esac
+            ;;
+          --style)
+            STYLE=${v,,}
+            case $STYLE in llvm | mozilla | google) ;; *) die "$E_USAGE" "unknown --style: $v" ;; esac
+            ;;
+          --generator)
+            GENERATOR=${v,,}
+            case $GENERATOR in auto | ninja | make) ;; *) die "$E_USAGE" "unknown --generator: $v" ;; esac
+            ;;
+          --std)
+            STD_SET=1
+            case ${v,,} in
+              c++*) CXX_STD=${v#*++} ;;
+              c[0-9]*) C_STD=${v#[cC]} ;;
+              *) CXX_STD=$v C_STD=$v ;;
+            esac
+            ;;
+          --c-std)
+            STD_SET=1
+            C_STD=${v#[cC]}
+            ;;
+        esac
+        ;;
+      *) die "$E_USAGE" "unknown option: $a (see --help)" ;;
+    esac
+  done
+}
+
+main() {
+  setup_colors
+  parse_args "$@"
+  setup_colors
+  if ((INTERACTIVE)) || { [[ -z $POS_CMD ]] && [[ -t 0 && -t 2 ]]; }; then
+    INTERACTIVE=1
+    cmd_wizard
+    return 0
+  fi
+  case $POS_CMD in
+    adopt) cmd_adopt ;;
+    init) cmd_init ;;
+    doctor) cmd_doctor ;;
+    help) usage ;;
+    "") usage >&2; exit "$E_USAGE" ;;
+    *) die "$E_USAGE" "unknown command: $POS_CMD (adopt | init | doctor)" ;;
+  esac
+}
+
+main "$@"
