@@ -27,7 +27,8 @@ cd ~/src/fastcalc && cmake --preset dev && cmake --build --preset dev && ctest -
 zed .
 
 zide adopt ~/src/legacy --dry-run   # preview the plan (with diffs) first
-zide adopt ~/src/legacy
+zide adopt ~/src/legacy             # safe by default: runs no project code
+zide adopt ~/src/legacy --configure # opt in to running the build system
 
 zide doctor                         # grouped report + "ready" / "N things to fix"
 zide doctor --json | jq .           # machine-readable variant
@@ -64,7 +65,8 @@ Full reference: `zide --help` (one screen). The most used:
 | `--style S` | clang-format base: `llvm \| mozilla \| google` |
 | `--no-git` | skip `git init` and the initial commit |
 | `--bare-remote D` | bare repo at `D` with a post-receive stub, added as `origin` |
-| `--no-configure` | skip running the build system (no `compile_commands.json`) |
+| `--no-configure` | `adopt`: never run the build system (this is the default); `init`: skip the initial `cmake --preset dev` |
+| `--configure` | `adopt`: run the build system to export `compile_commands.json` (project code executes) |
 | `--no-cmake` | `adopt`: never generate a `CMakeLists.txt` |
 | `--json` | `doctor`: machine-readable report on stdout |
 
@@ -80,11 +82,14 @@ unsafe operation, `130` interrupted. `doctor` exits `1` when a *required* tool
   `.zed/debug.json` — missing entries added by `label`.
 * `.clangd`, `.clang-format` (`--style`), `.clang-tidy`.
 * `.gitignore` — one managed block (`# >>> zide >>>`); your lines are untouched.
-* CMake projects: configures (`dev` preset if present, else `build/zide`) and
-  symlinks `compile_commands.json` to the root. Your `CMakeLists.txt` is never
-  modified. No build system at all: generates a reviewable `CMakeLists.txt`
-  from the sources (`--no-cmake` to skip). Make: `compiledb -n make`, or
-  `bear -- make -B` (a real build). Meson: `meson setup`. Bazel: a hint only.
+* CMake projects: with `--configure`, configures (`dev` preset if present,
+  else `build/zide`) and symlinks `compile_commands.json` to the root;
+  without it, no `compile_commands.json` is produced (re-run with
+  `--configure`, or configure the build yourself and re-run `adopt`).
+  Your `CMakeLists.txt` is never modified. No build system at all: generates
+  a reviewable `CMakeLists.txt` from the sources (`--no-cmake` to skip).
+  Make: with `--configure`, `compiledb -n make`, or `bear -- make -B`
+  (a real build). Meson: `meson setup`. Bazel: a hint only.
 
 `init <path>` (new project): `CMakeLists.txt`, `CMakePresets.json`
 (`dev`/`release`/`asan`/`ubsan`/`tsan`), `include/<name>/`, `src/`, `tests/`,
@@ -107,8 +112,12 @@ initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
   All generated JSON is validated with `jq` when installed.
 * Deterministic: same flags ⇒ byte-identical output (pin `--author`/`--year`
   for byte-identical licenses across machines/years).
-* Generating `compile_commands.json` runs your build system's configure step
-  (project build files execute); `--no-configure` skips it. stdout stays
+* `adopt` never executes project code (no CMake configure, no build) unless
+  you pass `--configure`; the exact command is announced before it runs.
+  `--no-configure` is retained for compatibility and means the same as
+  the default. (`init` still configures once, on files zide itself generated.)
+* Generating `compile_commands.json` with `--configure` runs your build
+  system's configure step (project build files execute). stdout stays
   data-only (`zide doctor | grep` works); all human output goes to stderr.
 
 ## Verify the Zed setup

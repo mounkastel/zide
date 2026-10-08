@@ -58,6 +58,15 @@ Investigated and **cleared** (kept for the record, no change needed):
   auto-run (current behavior, needed for the out-of-the-box clangd story) but print an
   explicit notice naming the command about to run, and document the risk + opt-out.
   Recorded as a conscious decision, not a silent behavior change.
+  **RESOLVED in 2.2.0** (supersedes the keep-auto-run decision above): default
+  `adopt` now executes nothing — no CMake configure, Meson setup, or
+  `compiledb`/`bear` run — unless the user passes the new `--configure` flag,
+  which prints `about to run (in <dir>): <exact command>` first; the wizard
+  asks and defaults to "no"; `--no-configure` is retained (now the default).
+  Proven by `tests/t-adopt-safe.sh`: an `execute_process` sentinel fires with
+  `--configure` and never fires by default, via `--no-configure`, via
+  `--dry-run` (±`--configure`), or through the wizard (pty-driven). `init` is
+  unchanged: it configures once, on files zide itself generated.
 - **S3 — quoting audit: PASS.** Every path reaching `rm/cp/mv/mkdir/install/ln/find/grep`
   is quoted with `--` (`zide:217,231,254,261,354,362-387,611,669,801,…`). Only gap is
   newline-in-filename (B11). `git add -A/commit` only touches a repo zide just created,
