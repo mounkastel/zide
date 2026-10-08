@@ -4,6 +4,9 @@ set -u
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 files=("$root"/tests/t-*.sh)
+# Compat mode: BASH_BIN points at the interpreter under test (see `make test-compat`).
+RUN_BASH=${BASH_BIN:-bash}
+printf 'runner: %s\n' "$("$RUN_BASH" --version | head -n 1)"
 total_ok=0
 total_bad=0
 total_skip=0
@@ -12,7 +15,7 @@ failed_files=()
 for t in "${files[@]}"; do
   name=$(basename -- "$t")
   printf '=== %s ===\n' "$name"
-  out=$(bash "$t" 2>&1)
+  out=$("$RUN_BASH" "$t" 2>&1)
   rc=$?
   printf '%s\n' "$out"
   n_ok=$(printf '%s\n' "$out" | grep -c '^ok ')

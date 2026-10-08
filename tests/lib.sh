@@ -12,6 +12,14 @@ TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/zide-test-home.XXXXXX")
 export HOME=$TEST_HOME
 export GIT_CONFIG_NOSYSTEM=1
 export LC_ALL=C
+# Compat mode: when BASH_BIN names another interpreter (see `make test-compat`),
+# shadow `bash` on PATH so shebang (`env bash`) lines and inner `bash -c` calls
+# under test use it too. Harmless when BASH_BIN is already first on PATH.
+if [[ -n ${BASH_BIN:-} && -x ${BASH_BIN:-} && $(command -v bash) != "$BASH_BIN" ]]; then
+  BASH_SHIM=$(mktemp -d "${TMPDIR:-/tmp}/zide-bashshim.XXXXXX")
+  ln -s "$BASH_BIN" "$BASH_SHIM/bash"
+  export PATH="$BASH_SHIM:$PATH"
+fi
 # rustup shims resolve toolchains via these homes: keep the real ones so cargo
 # works under the isolated HOME (guarded: standalone toolchains need nothing).
 if [[ -n $REAL_HOME && -d $REAL_HOME/.cargo ]]; then export CARGO_HOME=$REAL_HOME/.cargo; fi
