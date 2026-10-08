@@ -29,6 +29,7 @@ tap_ok "default adopt exits 0"
 if [[ ! -e $T/s1/SENTINEL_RAN ]]; then tap_ok "default adopt runs no project code"; else tap_not_ok "default adopt runs no project code"; fi
 if [[ ! -e $T/s1/compile_commands.json ]]; then tap_ok "no compilation database fabricated"; else tap_not_ok "no compilation database fabricated"; fi
 if grep -q -- "--configure" "$T/default.log"; then tap_ok "fallback message explains --configure"; else tap_not_ok "fallback message explains --configure"; fi
+if grep -q "degraded code intelligence" "$T/default.log"; then tap_ok "warning states the clangd consequence"; else tap_not_ok "warning states the clangd consequence"; fi
 if grep -q "deprecated" "$T/default.log"; then tap_not_ok "no deprecation noise by default"; else tap_ok "no deprecation noise by default"; fi
 
 # 2. Legacy --no-configure keeps working and executes nothing.

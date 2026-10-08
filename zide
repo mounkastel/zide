@@ -1121,7 +1121,7 @@ cmd_adopt() {
   fi
   adopt_compdb
   if ((DETECT_C || DETECT_CPP)) && [[ ! -e $ROOT/compile_commands.json ]] && ((!CONFIGURE)); then
-    warn "no compile_commands.json (configure was not run). Generate it with: zide adopt --configure $(printf '%q' "$ROOT"), or configure the build yourself and re-run adopt"
+    warn "no compile_commands.json (configure was not run): clangd in Zed will have degraded code intelligence (no accurate includes, defines, or jump-to-definition). Fix: zide adopt --configure $(printf '%q' "$ROOT"), or configure the build yourself and re-run adopt"
   fi
   adopt_zed
   adopt_clang
