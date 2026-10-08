@@ -2380,11 +2380,13 @@ ui_banner() {
 ui_section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
 
 # ui_input <var> <question> <default>   (readline editing, Tab completes paths)
+# The default is shown as a hint; the edit buffer starts empty. Enter on an
+# empty buffer accepts the default; typed text replaces it entirely.
 ui_input() {
   local -n _ui_ref=$1
   local ans=""
-  printf '%s?%s %s\n' "$C_CYAN" "$C_RESET" "$2" >&2
-  read -r -e -p "  > " -i "$3" ans || die 130 "input closed; wizard cancelled"
+  printf '%s?%s %s [%s]:\n' "$C_CYAN" "$C_RESET" "$2" "$3" >&2
+  read -r -e -p "  > " ans || die 130 "input closed; wizard cancelled"
   _ui_ref=${ans:-$3}
 }
 
