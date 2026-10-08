@@ -15,11 +15,12 @@ fi
 tap_ok "setup scaffold exits 0"
 
 before=$(tree_state "$T/proj")
-if ! "$ZIDE" adopt "$T/proj" --dry-run --no-configure >/dev/null 2>&1; then
+if ! "$ZIDE" adopt "$T/proj" --dry-run --no-configure >"$T/dry.log" 2>&1; then
   tap_not_ok "dry-run adopt exits 0"
   exit 1
 fi
 tap_ok "dry-run adopt exits 0"
+if grep -q "backups: 0" "$T/dry.log"; then tap_ok "dry-run counts no phantom backups"; else tap_not_ok "dry-run counts no phantom backups"; fi
 after=$(tree_state "$T/proj")
 if [[ $before == "$after" ]]; then
   tap_ok "--dry-run leaves the tree (incl. modes) unchanged"

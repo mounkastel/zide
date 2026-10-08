@@ -58,7 +58,9 @@ Investigated and **cleared** (kept for the record, no change needed):
   auto-run (current behavior, needed for the out-of-the-box clangd story) but print an
   explicit notice naming the command about to run, and document the risk + opt-out.
   Recorded as a conscious decision, not a silent behavior change.
-  **RESOLVED in 2.2.0** (supersedes the keep-auto-run decision above): default
+  **RESOLVED in 3.0.0** (supersedes the keep-auto-run decision above; the 2.2.0
+  number existed only in local development commits and was renamed to 3.0.0
+  as a breaking change): default
   `adopt` now executes nothing — no CMake configure, Meson setup, or
   `compiledb`/`bear` run — unless the user passes the new `--configure` flag,
   which prints `about to run (in <dir>): <exact command>` first; the wizard
@@ -154,3 +156,43 @@ All globals initialized (`DRY_RUN/VERBOSE/FORCE/YES/COLOR`, `ROOT`, `CREATED/…
 Nameref `local -n` needs Bash ≥4.3 — fine for the Bash 5+ requirement. No uninitialized
 expansion found; the suite will re-verify by running every command under `set -u`
 (which is already global via `set -Eeuo pipefail`).
+
+## 9. Resolution ledger (3.0.0 hardening pass)
+
+Every item above now carries a status. Line numbers refer to the audited v2.0.0
+file; code has since moved. Test files live in `tests/`.
+
+| Item | Status | Proof |
+|------|--------|-------|
+| B1, S1 (safe_path subdirs) | resolved | `/*` variants for system roots; `t-errors.sh` "init under /usr exits 4"; commit `d736be4` |
+| B2 (`--build` discarded) | resolved | `BUILD_SEL` honored by adopt/init; `t-adopt-build.sh`; `d736be4` |
+| B3 (adopt preset tasks) | resolved | preset `usep=1`; `t-adopt-cmake.sh` "preset project gets preset-style tasks"; `d736be4` |
+| B4 (internal traces, subshell traps) | resolved | `on_err` verbose-gated, `(cd…)` replaced by `run_in_root`; `t-errors.sh` "refusals carry no internal trace"; `d736be4` |
+| B5 (dry-run phantom backups) | resolved | `BACKUPS` untouched in dry-run; `t-dryrun.sh` "dry-run counts no phantom backups"; `d736be4` |
+| B6 (absolute compdb symlink) | resolved | relative-only reuse; `t-adopt-cmake.sh` "absolute compdb symlink tolerated"; `d736be4` |
+| B7 (dead no-op) | resolved | deleted; `d736be4` |
+| B8 (`--year` unvalidated) | resolved | `YYYY[-YYYY]` check; `t-init-validation.sh`; `d736be4` |
+| B9 (bare `--std` mapping) | resolved | C++-first mapping + `--c-std` hint; `t-init-validation.sh`; `d736be4` |
+| B10 (std prompt loop) | resolved | validation loops (+B14 re-prompt); interactive path, commit `d736be4` |
+| B11 (newline filenames) | resolved | `-print0`/`sort -z`; `t-adopt-nocmake.sh`; `d736be4` |
+| B12, B13 (git failures abort) | resolved | warn + continue; `t-init-validation.sh` "init survives failing git"; `d736be4` |
+| B14 (wizard prefill dies) | resolved | re-prompt on invalid prefill; `d736be4`, wizard covered by pty suite |
+| B15 (safe_path propagation) | resolved | explicit `\|\| exit "$?"`; `t-errors.sh` exit-4 assertions; `d736be4` |
+| Cleared (join_by, chmod, merge) | no change needed | stand as analyzed in §1 |
+| S2 (adopt executes code) | resolved in 3.0.0 | default no-execution, `--configure` + notice, wizard default-no; `t-adopt-safe.sh` sentinel/notice/pty; `b4d059b e18d073 20f02b4` |
+| S3 (quoting) | resolved | still PASS; gaps closed by B11/B12 tests |
+| S4 (temp files) | resolved | subshell trap removed; `mktemp` handling unchanged |
+| D1 (report stream) | resolved | reports → stderr; `t-report.sh`; `a8c724b` |
+| D2 (report vocabulary) | resolved | `updated` + backup list; `t-report.sh`; `a8c724b` |
+| D3 (gitignore merge-class) | resolved by documentation | README "Safety guarantees" states the exception |
+| U1 (usage) | resolved | grouped one-screen reference; `t-errors.sh` "--help documents --configure"; `a8c724b` |
+| U2 (error messages) | resolved | what/why/next-step everywhere; exit-code assertions suite-wide; `a8c724b` |
+| U3 (doctor) | resolved | grouped report + per-project scope; `t-doctor.sh`; `a8c724b 4728f6b` |
+| U4 (dry-run diffs) | resolved | capped unified diffs; `t-report.sh`; `a8c724b` |
+| U5 (wizard gaps) | resolved, Back deferred | validation fixed; per-step Back deferred — state-machine rewrite disproportionate to need; Cancel-at-summary + Ctrl+C are side-effect-free (verified: no writes before `wiz_apply`); follow-up if the wizard grows new flows |
+| U6 (progress) | resolved | elapsed times + pre-exec notices; `t-adopt-safe.sh`; `a8c724b` |
+| §5 duplication | declined | rationale stands: small, stable, behavior-critical; unification risks drift |
+| §6 dead code | resolved | B2 honored, noop deleted, `STRICT_JSON` kept (documented contexts) |
+| §7 missing tests | resolved | TAP suite, `make test/lint/fmt/test-compat`, `.github/workflows/ci.yml` |
+| §8 `set -u` | resolved by execution | suite runs under global `set -u`; full matrix also executed under Bash 5.0.0 via `make test-compat` |
+| 3.0.0 changes | resolved | safe-default (breaking, CHANGELOG), `--no-configure` deprecated (warning/help/CHANGELOG), warning consequence+remedy (tested), per-project doctor (implemented), Bash 5.0 by execution, CI |

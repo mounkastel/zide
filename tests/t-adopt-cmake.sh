@@ -43,6 +43,23 @@ else
   tap_not_ok "compile_commands.json symlinked after configure"
 fi
 
+# A project with a dev preset gets preset-style tasks (not dir-style).
+mkdir -p -- "$T/preset/src"
+cp "$P/CMakeLists.txt" "$T/preset/CMakeLists.txt"
+cp "$P/src/main.cpp" "$T/preset/src/main.cpp"
+cat >"$T/preset/CMakePresets.json" <<'EOF'
+{
+  "version": 3,
+  "configurePresets": [{ "name": "dev", "binaryDir": "${sourceDir}/build/dev" }]
+}
+EOF
+if ! "$ZIDE" adopt "$T/preset" --no-configure >/dev/null 2>&1; then
+  tap_not_ok "adopt preset project exits 0"
+  exit 1
+fi
+tap_ok "adopt preset project exits 0"
+if grep -q -- "--preset dev" "$T/preset/.zed/tasks.json"; then tap_ok "preset project gets preset-style tasks"; else tap_not_ok "preset project gets preset-style tasks"; fi
+
 # An absolute compile_commands.json symlink must not confuse build-dir reuse.
 T2=$(fresh_dir)
 track_tmp "$T2"

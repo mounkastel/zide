@@ -46,3 +46,14 @@ if ! "$ZIDE" init "$T/h" --lang c -y --no-configure --no-git --c-std 11 --author
   exit 1
 fi
 tap_ok "c --c-std 11 accepted"
+
+# A failing git must not fail the scaffold (warns and continues).
+mkdir -p -- "$T/fakebin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/fakebin/git"
+chmod +x "$T/fakebin/git"
+if ! PATH="$T/fakebin:$PATH" "$ZIDE" init "$T/nogit" --lang c -y --no-configure --author T --year 2024 >"$T/nogit.log" 2>&1; then
+  tap_not_ok "init survives failing git"
+  exit 1
+fi
+tap_ok "init survives failing git"
+if grep -q "continuing without" "$T/nogit.log"; then tap_ok "git failure warns and continues"; else tap_not_ok "git failure warns and continues"; fi

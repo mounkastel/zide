@@ -8,7 +8,7 @@ zide init  <path>   scaffold a new project that builds, tests and runs immediate
 zide doctor         toolchain report with per-distro install hints (apt/dnf/pacman/zypper)
 ```
 
-Requirements: Bash 5+, Linux, GNU coreutils. Optional tools (all degrade gracefully
+Requirements: Bash 5+ (verified on 5.0 and 5.3 via `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
 when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
 meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
 
@@ -65,7 +65,7 @@ Full reference: `zide --help` (one screen). The most used:
 | `--style S` | clang-format base: `llvm \| mozilla \| google` |
 | `--no-git` | skip `git init` and the initial commit |
 | `--bare-remote D` | bare repo at `D` with a post-receive stub, added as `origin` |
-| `--no-configure` | `adopt`: never run the build system (this is the default); `init`: skip the initial `cmake --preset dev` |
+| `--no-configure` | deprecated for `adopt` (this is the default); `init`: skip the initial `cmake --preset dev` |
 | `--configure` | `adopt`: run the build system to export `compile_commands.json` (project code executes) |
 | `--no-cmake` | `adopt`: never generate a `CMakeLists.txt` |
 | `--json` | `doctor`: machine-readable report on stdout |
@@ -114,8 +114,13 @@ initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
   for byte-identical licenses across machines/years).
 * `adopt` never executes project code (no CMake configure, no build) unless
   you pass `--configure`; the exact command is announced before it runs.
-  `--no-configure` is retained for compatibility and means the same as
-  the default. (`init` still configures once, on files zide itself generated.)
+  `--no-configure` is retained for compatibility (with a one-line deprecation
+  warning on `adopt`) and means the same as the default. (`init` still
+  configures once, on files zide itself generated.)
+* Without `compile_commands.json`, clangd in Zed has degraded code
+  intelligence (no accurate includes, defines, or jump-to-definition).
+  Generate the database with `zide adopt --configure <path>`, or configure
+  the build yourself and re-run `adopt`.
 * Generating `compile_commands.json` with `--configure` runs your build
   system's configure step (project build files execute). stdout stays
   data-only (`zide doctor | grep` works); all human output goes to stderr.
@@ -138,6 +143,7 @@ file reformats it via `.clang-format`.
 
 ```sh
 make test   # full matrix (builds real projects; missing toolchains skip with a reason)
+make test-compat  # same matrix under Bash 5.0 (oldest supported; builds it if needed)
 make lint   # shellcheck -x (needs shellcheck; skips gracefully if absent)
 make fmt    # shfmt -w on tests/ (needs shfmt; skips gracefully if absent)
 ./tests/run.sh   # same as make test

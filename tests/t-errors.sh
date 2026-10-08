@@ -36,6 +36,12 @@ if ((rc == 4)); then tap_ok "init \$HOME exits 4 (refused)"; else tap_not_ok "in
 "$ZIDE" init /usr/zide-probe-nonexistent --lang cpp -y --no-git >/dev/null 2>&1
 rc=$?
 if ((rc == 4)); then tap_ok "init under /usr exits 4 (refused)"; else tap_not_ok "init under /usr exits 4 (refused)"; fi
+if "$ZIDE" init /usr/zide-probe-nonexistent --lang cpp -y --no-git 2>&1 | grep -q "internal error"; then
+  tap_not_ok "refusals carry no internal trace"
+else
+  tap_ok "refusals carry no internal trace"
+fi
+if "$ZIDE" --help 2>/dev/null | grep -q -- "--configure"; then tap_ok "--help documents --configure"; else tap_not_ok "--help documents --configure"; fi
 
 "$ZIDE" doctor >/dev/null 2>&1
 rc=$?
