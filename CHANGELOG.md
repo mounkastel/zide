@@ -23,6 +23,13 @@ listed under the release.
 * `compile_commands.json` is produced only with `--configure` (or when you
   configure the build yourself and re-run `adopt`).
 
+### Deprecated
+
+* `--no-configure` for `adopt`: not configuring is now the default, so the
+  flag is a no-op there. It is still accepted (with a one-line warning) and
+  will not be removed in 3.x. For `init` it is unchanged: it still skips the
+  initial `cmake --preset dev`.
+
 ### Fixed
 
 * All `adopt` executions now run with the project directory as the working

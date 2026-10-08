@@ -804,7 +804,7 @@ cargo_pkg_name() {
 # --------------------------------------------------------------------------
 # Mode 1: adopt
 # --------------------------------------------------------------------------
-NO_CMAKE=0 NO_CONFIGURE=0 CONFIGURE=0
+NO_CMAKE=0 NO_CONFIGURE=0 CONFIGURE=0 NO_CONFIGURE_FLAG=0
 C_STD=17 CXX_STD=20
 BUILD_DIR="" PRESET="" DB_DIR="."
 
@@ -1076,6 +1076,9 @@ cmd_adopt() {
   scan_files
   detect_languages
   detect_builds
+  if ((NO_CONFIGURE_FLAG)); then
+    warn "--no-configure is deprecated for adopt (not configuring is the default); the flag is accepted and changes nothing"
+  fi
   if [[ -n $BUILD_SEL ]]; then
     case $BUILD_SEL in
       cmake)
@@ -2258,7 +2261,7 @@ adopt:
   --build B        drive only this build system: cmake | cargo
   --configure      run the build system to export compile_commands.json
                    (project code executes; the default is to run nothing)
-  --no-configure   never run the build system (this is the default)
+  --no-configure   deprecated for adopt: this is the default (kept working)
   --no-cmake       never generate a CMakeLists.txt
   --std N          standard for a generated CMakeLists (C++ 17|20|23, C 11|17|23)
   --style S        clang-format base: llvm | mozilla | google
@@ -2625,7 +2628,7 @@ parse_args() {
       --json) JSON_OUT=1 ;; # machine-readable output (currently: doctor only)
       --no-cmake) NO_CMAKE=1 ;;
       --configure) CONFIGURE=1; NO_CONFIGURE=0 ;;
-      --no-configure) NO_CONFIGURE=1; CONFIGURE=0 ;;
+      --no-configure) NO_CONFIGURE=1; CONFIGURE=0; NO_CONFIGURE_FLAG=1 ;;
       --strict) STRICT=1 ;;
       --benchmarks) BENCH=1 ;;
       --no-bench) BENCH=0 ;;

@@ -29,13 +29,15 @@ tap_ok "default adopt exits 0"
 if [[ ! -e $T/s1/SENTINEL_RAN ]]; then tap_ok "default adopt runs no project code"; else tap_not_ok "default adopt runs no project code"; fi
 if [[ ! -e $T/s1/compile_commands.json ]]; then tap_ok "no compilation database fabricated"; else tap_not_ok "no compilation database fabricated"; fi
 if grep -q -- "--configure" "$T/default.log"; then tap_ok "fallback message explains --configure"; else tap_not_ok "fallback message explains --configure"; fi
+if grep -q "deprecated" "$T/default.log"; then tap_not_ok "no deprecation noise by default"; else tap_ok "no deprecation noise by default"; fi
 
 # 2. Legacy --no-configure keeps working and executes nothing.
-if ! "$ZIDE" adopt "$T/s1" --no-configure >/dev/null 2>&1; then
+if ! "$ZIDE" adopt "$T/s1" --no-configure >"$T/ncflag.log" 2>&1; then
   tap_not_ok "adopt --no-configure exits 0"
   exit 1
 fi
 tap_ok "adopt --no-configure exits 0"
+if [[ $(grep -c "deprecated" "$T/ncflag.log") -eq 1 ]]; then tap_ok "--no-configure warns once"; else tap_not_ok "--no-configure warns once"; fi
 if [[ ! -e $T/s1/SENTINEL_RAN ]]; then tap_ok "--no-configure runs no project code"; else tap_not_ok "--no-configure runs no project code"; fi
 
 # 3. --dry-run executes nothing, with or without --configure.
