@@ -36,7 +36,7 @@ if ! have_tool cmake; then
   tap_skip "configure links compile_commands.json" "cmake not installed"
   exit 0
 fi
-"$ZIDE" adopt "$P" >/dev/null 2>&1
+"$ZIDE" adopt "$P" --configure >/dev/null 2>&1
 if [[ -L $P/compile_commands.json ]]; then
   tap_ok "compile_commands.json symlinked after configure"
 else
