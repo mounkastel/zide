@@ -17,6 +17,9 @@ test-compat:
 	@if [ -n "$(BASH_BIN)" ] && [ -x "$(BASH_BIN)" ]; then \
 	  echo "test-compat: using BASH_BIN=$(BASH_BIN)"; \
 	  BASH_BIN="$(BASH_BIN)" tests/run.sh; \
+	elif [ "$$(bash -c 'echo $${BASH_VERSINFO[0]}.$${BASH_VERSINFO[1]}')" = "5.0" ]; then \
+	  echo "test-compat: system bash is 5.0"; \
+	  tests/run.sh; \
 	elif docker info >/dev/null 2>&1; then \
 	  echo "test-compat: using docker (ubuntu:20.04, bash 5.0)"; \
 	  docker run --rm -v "$(PWD):/work" -w /work ubuntu:20.04 \

@@ -1,0 +1,41 @@
+# CI: lint, full test matrix, Bash 5.0 compat, and pty-driven wizard tests.
+name: ci
+on: [push, pull_request]
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain and lint tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck cmake ninja-build gcc g++ git jq make cargo rustc
+          curl -sSL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.11.0/shfmt_v3.11.0_linux_amd64
+          chmod +x /tmp/shfmt && sudo mv /tmp/shfmt /usr/local/bin/shfmt
+      - run: make lint
+      - run: make test
+        env:
+          ZIDE_REQUIRE_PTY: "1"
+  compat:
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake ninja-build gcc g++ git jq make curl ca-certificates cargo rustc
+      - run: make test-compat
+        env:
+          ZIDE_REQUIRE_PTY: "1"
+  wizard-pty:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake gcc git
+      - run: bash tests/t-adopt-safe.sh
+        env:
+          ZIDE_REQUIRE_PTY: "1"

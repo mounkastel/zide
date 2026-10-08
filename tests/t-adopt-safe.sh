@@ -69,8 +69,17 @@ if ! have_tool cmake; then tap_skip "--configure runs the build" "cmake not inst
 fi
 
 # 5. Wizard defaults to no execution (driven through a pty).
+# ZIDE_REQUIRE_PTY=1 (set in CI) turns a missing script(1) into failures.
 if ! have_tool script; then
-  tap_skip "wizard defaults to no execution" "script(1) not installed"
+  if [[ -n ${ZIDE_REQUIRE_PTY:-} ]]; then
+    tap_not_ok "wizard adopt exits 0 (script(1) missing but required)"
+    tap_not_ok "wizard runs no project code by default (script(1) missing but required)"
+    tap_not_ok "wizard still writes configuration (script(1) missing but required)"
+  else
+    tap_skip "wizard adopt exits 0" "script(1) not installed"
+    tap_skip "wizard runs no project code by default" "script(1) not installed"
+    tap_skip "wizard still writes configuration" "script(1) not installed"
+  fi
 else
   make_sentinel_fixture "$T/wiz"
   # Style / configure(n) / force(n) / Ready(apply) / do-something-else(n).
