@@ -4,6 +4,13 @@ All notable changes to `zide` are recorded here. Versioning follows SemVer:
 no command or flag has been renamed; where observable behavior changed, it is
 listed under the release.
 
+## [Unreleased]
+
+### Added
+
+* `make uninstall` (removes `$(DESTDIR)$(PREFIX)/bin/zide`, nothing else).
+* `DESTDIR` support for `make install` (staged installs, e.g. packaging).
+
 ## [3.0.0] — 2026-10-08
 
 ### Breaking changes

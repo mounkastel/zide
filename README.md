@@ -24,6 +24,14 @@ curl -fsSL https://raw.githubusercontent.com/mounkastel/zide/main/zide -o ~/.loc
 chmod +x ~/.local/bin/zide
 ```
 
+### Uninstall
+
+```sh
+make uninstall                 # removes ~/.local/bin/zide
+make uninstall PREFIX=/usr/local
+make uninstall DESTDIR=<stage> PREFIX=/usr/local  # packagers: staged removal
+```
+
 ## Migrating from 2.x
 
 3.0.0 no longer runs the build during `adopt`, so scripts (CI jobs included)
