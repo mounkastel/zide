@@ -1,4 +1,4 @@
-.PHONY: test test-compat bash50 lint fmt install
+.PHONY: test test-compat bash50 lint fmt install uninstall
 
 TEST_SH := $(wildcard tests/t-*.sh)
 
@@ -56,6 +56,11 @@ fmt:
 	fi
 
 PREFIX ?= $(HOME)/.local
+DESTDIR ?=
 
 install:
-	install -D -m 0755 zide $(PREFIX)/bin/zide
+	install -d "$(DESTDIR)$(PREFIX)/bin"
+	install -m 0755 zide "$(DESTDIR)$(PREFIX)/bin/zide"
+
+uninstall:
+	rm -f "$(DESTDIR)$(PREFIX)/bin/zide"
