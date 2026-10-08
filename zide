@@ -27,7 +27,7 @@ if ((BASH_VERSINFO[0] < 5)); then
   exit 2
 fi
 
-readonly ZIDE_VERSION="2.1.0"
+readonly ZIDE_VERSION="2.2.0"
 readonly PROG="zide"
 readonly E_USAGE=2 E_JSON=3 E_REFUSED=4
 
@@ -804,7 +804,7 @@ cargo_pkg_name() {
 # --------------------------------------------------------------------------
 # Mode 1: adopt
 # --------------------------------------------------------------------------
-NO_CMAKE=0 NO_CONFIGURE=0
+NO_CMAKE=0 NO_CONFIGURE=0 CONFIGURE=0
 C_STD=17 CXX_STD=20
 BUILD_DIR="" PRESET="" DB_DIR="."
 
@@ -872,13 +872,32 @@ add_library(${ident}_core"$'\n'
   put_str "$ROOT/CMakeLists.txt" text 644 "$body"
 }
 
+# announce_run <cmd...>: one-line pre-execution notice (stderr) naming the exact
+# command and the directory it will run in. Always precedes execution.
+announce_run() {
+  local parts=() a
+  for a in "$@"; do parts+=("$(printf '%q' "$a")"); done
+  info "about to run (in $ROOT): ${parts[*]}"
+}
+
+# run_in_root <description> <cmd...>: announce, then run <cmd...> with cwd=$ROOT
+# via try_run (captured output; nothing runs under --dry-run).
+run_in_root() {
+  local desc=$1
+  shift
+  announce_run "$@"
+  try_run "$desc" bash -c 'cd -- "$1" && shift && "$@"' _ "$ROOT" "$@"
+}
+
 adopt_compdb() {
   local gen=() db
   if ((!DETECT_C && !DETECT_CPP)); then return 0; fi
-  if ((!NO_CONFIGURE)); then
+  if ((!CONFIGURE)); then
+    info "skipping configure (default; pass --configure to run the build system and export compile_commands.json)"
+  else
     case $CC_BUILD in
       cmake | meson)
-        info "generating compile_commands.json runs the project's '$CC_BUILD' configure step (project files execute; --no-configure to skip)"
+        info "generating compile_commands.json runs the project's '$CC_BUILD' configure step (project files execute)"
         ;;
     esac
   fi
@@ -895,45 +914,45 @@ adopt_compdb() {
         PRESET=dev BUILD_DIR=build/dev
       fi
       DB_DIR=$BUILD_DIR
-      if ((NO_CONFIGURE)); then
-        info "--no-configure: skipping cmake configure"
+      if ((!CONFIGURE)); then
+        : # skipped (see notice above); nothing here may execute project code
       elif [[ ! -f $ROOT/$BUILD_DIR/compile_commands.json ]]; then
         if ! have cmake; then
           warn "cmake not found; cannot export compile_commands.json -> $(install_hint cmake)"
         elif [[ -n $PRESET ]]; then
-          try_run "cmake --preset dev (exporting compile commands)" \
-            bash -c 'cd -- "$1" && cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON' _ "$ROOT" || true
+          run_in_root "cmake --preset dev (exporting compile commands)" \
+            cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON || true
         else
-          try_run "cmake configure -> $BUILD_DIR (exporting compile commands)" \
-            cmake -S "$ROOT" -B "$ROOT/$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}" || true
+          run_in_root "cmake configure -> $BUILD_DIR (exporting compile commands)" \
+            cmake -S . -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}" || true
         fi
       fi
       if [[ -f $ROOT/$BUILD_DIR/compile_commands.json ]] && [[ ! -e $ROOT/compile_commands.json || -L $ROOT/compile_commands.json ]]; then
         link_compdb "$BUILD_DIR/compile_commands.json"
-      elif ((!DRY_RUN)) && [[ ! -e $ROOT/compile_commands.json ]]; then
-        warn "compile_commands.json not produced yet; run the 'configure' task (clangd will find it in $BUILD_DIR)"
+      elif ((CONFIGURE)) && ((!DRY_RUN)) && [[ ! -e $ROOT/compile_commands.json ]]; then
+        warn "compile_commands.json not produced although configure ran; check the output above, then re-run adopt"
       fi
       ;;
     meson)
       BUILD_DIR=build/zide DB_DIR=build/zide
-      if ((NO_CONFIGURE)); then
-        :
+      if ((!CONFIGURE)); then
+        : # skipped (see notice above); nothing here may execute project code
       elif ! have meson; then
         warn "meson not found -> $(install_hint meson)"
       elif [[ ! -f $ROOT/$BUILD_DIR/build.ninja ]]; then
-        try_run "meson setup $BUILD_DIR" meson setup "$ROOT/$BUILD_DIR" "$ROOT" || true
+        run_in_root "meson setup $BUILD_DIR" meson setup "$BUILD_DIR" . || true
       fi
       if [[ -f $ROOT/$BUILD_DIR/compile_commands.json ]]; then link_compdb "$BUILD_DIR/compile_commands.json"; fi
       ;;
     make)
       DB_DIR="."
-      if [[ -e $ROOT/compile_commands.json || $NO_CONFIGURE -eq 1 ]]; then
-        :
+      if [[ -e $ROOT/compile_commands.json ]] || ((!CONFIGURE)); then
+        : # skipped (see notice above); nothing here may execute project code
       elif have compiledb; then
-        try_run "compiledb -n make (no build performed)" bash -c 'cd -- "$1" && compiledb -n make' _ "$ROOT" || true
+        run_in_root "compiledb -n make (no build performed)" compiledb -n make || true
       elif have bear; then
         warn "bear must run a real build; forcing 'make -B' so every file is compiled"
-        try_run "bear -- make -B" bash -c 'cd -- "$1" && bear -- make -B -j"$(nproc)"' _ "$ROOT" || true
+        run_in_root "bear -- make -B" bear -- make -B "-j$(nproc)" || true
       else
         warn "no compile_commands generator for Make -> $(install_hint bear)  (or: $(install_hint compiledb))"
       fi
@@ -1098,6 +1117,9 @@ cmd_adopt() {
     detect_builds
   fi
   adopt_compdb
+  if ((DETECT_C || DETECT_CPP)) && [[ ! -e $ROOT/compile_commands.json ]] && ((!CONFIGURE)); then
+    warn "no compile_commands.json (configure was not run). Generate it with: zide adopt --configure $(printf '%q' "$ROOT"), or configure the build yourself and re-run adopt"
+  fi
   adopt_zed
   adopt_clang
   put_block "$ROOT/.gitignore" "$(gitignore_body)"
@@ -2234,8 +2256,10 @@ Run control:
 
 adopt:
   --build B        drive only this build system: cmake | cargo
+  --configure      run the build system to export compile_commands.json
+                   (project code executes; the default is to run nothing)
+  --no-configure   never run the build system (this is the default)
   --no-cmake       never generate a CMakeLists.txt
-  --no-configure   skip configure (no compile_commands.json is produced)
   --std N          standard for a generated CMakeLists (C++ 17|20|23, C 11|17|23)
   --style S        clang-format base: llvm | mozilla | google
 
@@ -2274,7 +2298,7 @@ EOF
 # --------------------------------------------------------------------------
 INTERACTIVE=0
 RUN_RC=0
-WIZ_VARS=(LANG_SEL INIT_NAME TESTFW LICENSE_SEL AUTHOR YEAR STRICT BENCH GIT STYLE C_STD CXX_STD STD_SET NO_CMAKE NO_CONFIGURE POS_PATH BARE_REMOTE FORCE)
+WIZ_VARS=(LANG_SEL INIT_NAME TESTFW LICENSE_SEL AUTHOR YEAR STRICT BENCH GIT STYLE C_STD CXX_STD STD_SET NO_CMAKE NO_CONFIGURE CONFIGURE POS_PATH BARE_REMOTE FORCE)
 declare -A WIZ_SNAP=()
 
 wiz_snapshot() {
@@ -2531,7 +2555,7 @@ wizard_adopt() {
     fi
     ui_choose STYLE "clang-format style (an existing .clang-format is never touched)" "$STYLE" \
       "llvm|LLVM" "google|Google" "mozilla|Mozilla"
-    if ui_confirm "Run the build system to generate compile_commands.json now?" "$([[ $NO_CONFIGURE == 1 ]] && echo n || echo y)"; then NO_CONFIGURE=0; else NO_CONFIGURE=1; fi
+    if ui_confirm "Run the build system to generate compile_commands.json now? (project code will execute)" "$([[ $CONFIGURE == 1 ]] && echo y || echo n)"; then CONFIGURE=1; NO_CONFIGURE=0; else CONFIGURE=0; NO_CONFIGURE=1; fi
   fi
   if ui_confirm "Replace files that differ from the templates? (No = keep yours and merge .zed/*.json)" "$([[ $FORCE == 1 ]] && echo y || echo n)"; then FORCE=1; else FORCE=0; fi
   ui_section "Summary"
@@ -2600,7 +2624,8 @@ parse_args() {
       --no-color) COLOR=never ;;
       --json) JSON_OUT=1 ;; # machine-readable output (currently: doctor only)
       --no-cmake) NO_CMAKE=1 ;;
-      --no-configure) NO_CONFIGURE=1 ;;
+      --configure) CONFIGURE=1; NO_CONFIGURE=0 ;;
+      --no-configure) NO_CONFIGURE=1; CONFIGURE=0 ;;
       --strict) STRICT=1 ;;
       --benchmarks) BENCH=1 ;;
       --no-bench) BENCH=0 ;;
