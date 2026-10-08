@@ -11,6 +11,26 @@ listed under the release.
 * `make uninstall` (removes `$(DESTDIR)$(PREFIX)/bin/zide`, nothing else).
 * `DESTDIR` support for `make install` (staged installs, e.g. packaging).
 
+## [3.1.0] — 2026-10-08
+
+### Added
+
+* A leading `~` or `~/...` in path arguments (`adopt`/`init`
+  `<project-path>`, `--bare-remote`, `doctor [path]`) and in wizard path
+  prompts expands to `$HOME` before anything else runs. `~user` forms are not
+  expanded and are handled as literal paths. A bare `~` therefore refuses
+  with exit 4, exactly as `$HOME` itself does; when `HOME` is unset or empty,
+  `~` paths fail with exit 2 and a clear message instead of falling back to
+  a relative path. The wizard summary and the final reports show the expanded
+  absolute path.
+
+### Fixed
+
+* Wizard text prompts show the default as a hint (`Project directory
+  [./my-project]:`) and start with an empty input buffer. Pressing Enter on
+  an empty buffer still accepts the default, and typed text replaces the
+  default entirely instead of being appended to pre-filled text.
+
 ## [3.0.0] — 2026-10-08
 
 ### Breaking changes

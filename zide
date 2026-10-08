@@ -27,7 +27,7 @@ if ((BASH_VERSINFO[0] < 5)); then
   exit 2
 fi
 
-readonly ZIDE_VERSION="3.0.0"
+readonly ZIDE_VERSION="3.1.0"
 readonly PROG="zide"
 readonly E_USAGE=2 E_JSON=3 E_REFUSED=4
 
@@ -301,6 +301,7 @@ cmd_doctor() {
   local t scope=""
   DOC_PROJECT=""
   if [[ -n ${POS_PATH:-} ]]; then
+    POS_PATH=$(expand_tilde "$POS_PATH") || exit "$?"
     ROOT=$(safe_path "$POS_PATH") || exit "$?"
     [[ -d $ROOT ]] || die "$E_USAGE" "doctor: not a directory: $ROOT. Pass a project path, or run bare 'zide doctor' for the global toolchain report"
     scan_files
@@ -340,6 +341,25 @@ ROOT=""
 CREATED=() UPDATED=() UNCHANGED=() KEPT=() BACKUPS=()
 
 rel() { printf '%s' "${1#"$ROOT"/}"; }
+
+# Expand a leading ~ or ~/ using $HOME. Only a bare ~ or ~/... is expanded;
+# ~user forms are left unchanged for the existing path checks to handle.
+# Fails with E_USAGE when HOME is unset or empty.
+expand_tilde() {
+  local p=$1
+  # Quoted "~" patterns are intentional: only a literal leading ~ or ~/
+  # expands (a shell would have expanded an unquoted ~ before we see it).
+  # shellcheck disable=SC2088
+  case $p in
+    '~' | '~/'*)
+      [[ -n ${HOME:-} ]] || die "$E_USAGE" "cannot expand '~' in path '$p': HOME is unset or empty (set HOME or use an absolute path)"
+      printf '%s' "${p/#\~/$HOME}"
+      ;;
+    *)
+      printf '%s' "$p"
+      ;;
+  esac
+}
 
 safe_path() {
   local p=$1 abs
@@ -1108,6 +1128,7 @@ print_report() {
 
 cmd_adopt() {
   [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "adopt: missing <project-path>. Usage: zide adopt <project-path> [--dry-run]"
+  POS_PATH=$(expand_tilde "$POS_PATH") || exit "$?"
   ROOT=$(safe_path "$POS_PATH") || exit "$?"
   [[ -d $ROOT ]] || die "$E_USAGE" "adopt: not a directory: $ROOT. Check the path, or scaffold a project with: zide init <path> --lang cpp -y"
   scan_files
@@ -2195,7 +2216,8 @@ init_git() {
 init_bare_remote() {
   [[ -n $BARE_REMOTE ]] || return 0
   local remote
-  remote=$(safe_path "$BARE_REMOTE")
+  BARE_REMOTE=$(expand_tilde "$BARE_REMOTE") || exit "$?"
+  remote=$(safe_path "$BARE_REMOTE") || exit "$?"
   if [[ -e $remote ]]; then
     [[ -d $remote ]] || die "$E_REFUSED" "bare remote path is not a directory: $remote (pass an empty directory to --bare-remote)"
     if [[ -n $(find "$remote" -mindepth 1 -maxdepth 1 -print -quit) ]] && ((!FORCE)); then
@@ -2228,6 +2250,7 @@ EOF
 
 cmd_init() {
   [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "init: missing <project-path>. Usage: zide init <project-path> --lang <c | cpp | rust> -y"
+  POS_PATH=$(expand_tilde "$POS_PATH") || exit "$?"
   ROOT=$(safe_path "$POS_PATH") || exit "$?"
   if [[ -e $ROOT && ! -d $ROOT ]]; then die "$E_REFUSED" "target exists and is not a directory: $ROOT (pick another path)"; fi
   init_resolve
@@ -2357,11 +2380,13 @@ ui_banner() {
 ui_section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
 
 # ui_input <var> <question> <default>   (readline editing, Tab completes paths)
+# The default is shown as a hint; the edit buffer starts empty. Enter on an
+# empty buffer accepts the default; typed text replaces it entirely.
 ui_input() {
   local -n _ui_ref=$1
   local ans=""
-  printf '%s?%s %s\n' "$C_CYAN" "$C_RESET" "$2" >&2
-  read -r -e -p "  > " -i "$3" ans || die 130 "input closed; wizard cancelled"
+  printf '%s?%s %s [%s]:\n' "$C_CYAN" "$C_RESET" "$2" "$3" >&2
+  read -r -e -p "  > " ans || die 130 "input closed; wizard cancelled"
   _ui_ref=${ans:-$3}
 }
 
@@ -2479,6 +2504,7 @@ wizard_init() {
   ui_section "New project"
   while true; do
     if [[ -z $POS_PATH ]]; then ui_input POS_PATH "Project directory (created if missing)" "./my-project"; fi
+    POS_PATH=$(expand_tilde "$POS_PATH") || exit "$?"
     if ROOT=$(safe_path "$POS_PATH"); then break; fi
     POS_PATH=""
   done
@@ -2573,6 +2599,7 @@ wizard_adopt() {
   ui_section "Adopt an existing project"
   while true; do
     if [[ -z $POS_PATH ]]; then ui_input POS_PATH "Path to the project" "."; fi
+    POS_PATH=$(expand_tilde "$POS_PATH") || exit "$?"
     if ROOT=$(safe_path "$POS_PATH") && [[ -d $ROOT ]]; then break; fi
     err "not a directory: $POS_PATH"
     POS_PATH=""
