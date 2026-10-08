@@ -84,8 +84,12 @@ cleanup() {
 on_err() {
   local rc=$?
   # die() already reported deliberate failures (also when raised inside $(...)).
-  case $rc in "$E_USAGE" | "$E_JSON" | "$E_REFUSED") return 0 ;; esac
-  err "internal error (exit $rc) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  case $rc in "$E_USAGE" | "$E_JSON" | "$E_REFUSED" | 130) return 0 ;; esac
+  if ((VERBOSE)); then
+    err "internal error (exit $rc) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  else
+    err "command failed (exit $rc): ${BASH_COMMAND} (re-run with --verbose for the location)"
+  fi
 }
 trap on_err ERR
 trap cleanup EXIT
@@ -207,8 +211,8 @@ safe_path() {
   [[ -n $p ]] || die "$E_USAGE" "empty project path"
   abs=$(realpath -m -- "$p")
   case $abs in
-    / | /bin | /boot | /dev | /etc | /lib | /lib64 | /proc | /root | /run | /sbin | /sys | /usr | /var | "${HOME:-/nonexistent}")
-      die "$E_REFUSED" "refusing to operate on protected path: $abs"
+    / | /bin | /bin/* | /boot | /boot/* | /dev | /dev/* | /etc | /etc/* | /home | /lib | /lib/* | /lib64 | /lib64/* | /opt | /opt/* | /proc | /proc/* | /root | /root/* | /run | /run/* | /sbin | /sbin/* | /srv | /srv/* | /sys | /sys/* | /usr | /usr/* | /var | /var/* | "${HOME:-/nonexistent}")
+      die "$E_REFUSED" "refusing to operate on protected path '$abs': system locations are never touched (pick a directory under your home instead)"
       ;;
   esac
   printf '%s' "$abs"
@@ -235,8 +239,8 @@ backup_file() {
   else
     cp -a -- "$path" "$b"
     info "backup: $(rel "$path") -> $(rel "$b")"
+    BACKUPS+=("$(rel "$b")")
   fi
-  BACKUPS+=("$(rel "$b")")
 }
 
 # commit_file <src> <dest> <mode> <allow_modify:0|1>
@@ -393,19 +397,22 @@ link_compdb() { # <relative-target>
 }
 
 # Run an external command; capture output and show the tail on failure.
+# Never clobbers the caller's $TMP_LAST (templates may be mid-flight).
 try_run() { # <description> <cmd...>
-  local desc=$1 rc=0
+  local desc=$1 rc=0 prev_tmp=$TMP_LAST log
   shift
   if ((DRY_RUN)); then
     dry "$desc: $*"
     return 0
   fi
   mk_tmp
+  log=$TMP_LAST
+  TMP_LAST=$prev_tmp
   info "$desc"
-  "$@" >"$TMP_LAST" 2>&1 || rc=$?
+  "$@" >"$log" 2>&1 || rc=$?
   if ((rc)); then
     warn "$desc failed (exit $rc); last output:"
-    tail -n 8 "$TMP_LAST" | sed 's/^/        /' >&2
+    tail -n 8 "$log" | sed 's/^/        /' >&2
     return 1
   fi
   return 0
@@ -611,12 +618,12 @@ CC_BUILD=none
 scan_files() {
   FILES=()
   local f
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     FILES+=("${f#"$ROOT"/}")
   done < <(find "$ROOT" -mindepth 1 -maxdepth 8 \
     \( -name .git -o -name build -o -name 'build-*' -o -name 'cmake-build-*' -o -name target \
     -o -name node_modules -o -name third_party -o -name vendor -o -name external \
-    -o -name .cache -o -name .zed \) -prune -o -type f -print 2>/dev/null | LC_ALL=C sort)
+    -o -name .cache -o -name .zed \) -prune -o -type f -print0 2>/dev/null | LC_ALL=C sort -z)
 }
 
 detect_languages() {
@@ -762,7 +769,9 @@ adopt_compdb() {
       BUILD_DIR=build/zide PRESET=""
       if [[ -L $ROOT/compile_commands.json ]]; then
         db=$(readlink -- "$ROOT/compile_commands.json")
-        if [[ $db == */* ]]; then BUILD_DIR=$(dirname -- "$db"); fi
+        # Only reuse a relative target: an absolute symlink points outside the
+        # tree and must not be rewritten into a $ROOT-relative build dir.
+        if [[ $db != /* && $db == */* ]]; then BUILD_DIR=$(dirname -- "$db"); fi
       elif [[ -f $ROOT/CMakePresets.json ]] && have jq &&
         jq -e '.configurePresets[]? | select(.name=="dev")' -- "$ROOT/CMakePresets.json" >/dev/null 2>&1; then
         PRESET=dev BUILD_DIR=build/dev
@@ -774,8 +783,8 @@ adopt_compdb() {
         if ! have cmake; then
           warn "cmake not found; cannot export compile_commands.json -> $(install_hint cmake)"
         elif [[ -n $PRESET ]]; then
-          (cd "$ROOT" && try_run "cmake --preset dev (exporting compile commands)" \
-            cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON) || true
+          try_run "cmake --preset dev (exporting compile commands)" \
+            bash -c 'cd -- "$1" && cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON' _ "$ROOT" || true
         else
           try_run "cmake configure -> $BUILD_DIR (exporting compile commands)" \
             cmake -S "$ROOT" -B "$ROOT/$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}" || true
@@ -836,7 +845,7 @@ adopt_zed() {
           targets=("${targets[@]:0:24}")
         fi
         if [[ -n $PRESET ]]; then
-          tasks_cmake "$PRESET" "$BUILD_DIR" 0 "${targets[@]}"
+          tasks_cmake "$PRESET" "$BUILD_DIR" 1 "${targets[@]}"
         else
           tasks_cmake "" "$BUILD_DIR" 0 "${targets[@]}"
         fi
@@ -920,12 +929,26 @@ print_report() {
 }
 
 cmd_adopt() {
-  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "adopt: missing <project-path>"
-  ROOT=$(safe_path "$POS_PATH")
-  [[ -d $ROOT ]] || die "$E_USAGE" "adopt: not a directory: $ROOT"
+  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "adopt: missing <project-path>. Usage: zide adopt <project-path> [--dry-run]"
+  ROOT=$(safe_path "$POS_PATH") || exit "$?"
+  [[ -d $ROOT ]] || die "$E_USAGE" "adopt: not a directory: $ROOT. Check the path, or scaffold a project with: zide init <path> --lang cpp -y"
   scan_files
   detect_languages
   detect_builds
+  if [[ -n $BUILD_SEL ]]; then
+    case $BUILD_SEL in
+      cmake)
+        [[ -f $ROOT/CMakeLists.txt ]] || die "$E_USAGE" "adopt: --build cmake needs a CMakeLists.txt under $ROOT (detected: ${BUILDS[*]:-none}). Drop --build to let zide detect or generate one."
+        BUILDS=(cmake)
+        CC_BUILD=cmake
+        ;;
+      cargo)
+        [[ -f $ROOT/Cargo.toml ]] || die "$E_USAGE" "adopt: --build cargo needs a Cargo.toml under $ROOT (detected: ${BUILDS[*]:-none}). Drop --build to let zide detect the build."
+        BUILDS=(cargo)
+        CC_BUILD=none
+        ;;
+    esac
+  fi
   info "adopting $ROOT"
   info "languages: $(langs_label); build systems: ${BUILDS[*]:-none}"
   if ((DETECT_C || DETECT_CPP)); then
@@ -942,7 +965,7 @@ cmd_adopt() {
   need_tool gdb 0 "debugger"
   need_tool lldb 0 "debugger (CodeLLDB is bundled with Zed)"
   if ((!DETECT_C && !DETECT_CPP && !DETECT_RUST)); then
-    die "$E_USAGE" "no C, C++ or Rust sources found under $ROOT"
+    die "$E_USAGE" "no C, C++ or Rust sources found under $ROOT. To scaffold a new project instead: zide init <path> --lang <c | cpp | rust> -y"
   fi
   if (((DETECT_C || DETECT_CPP) && ${#BUILDS[@]} == 0 && !NO_CMAKE)); then
     info "no build system found; generating a CMakeLists.txt from the sources"
@@ -965,7 +988,7 @@ cmd_adopt() {
 # Mode 2: init
 # --------------------------------------------------------------------------
 LANG_SEL="" INIT_NAME="" TESTFW="" LICENSE_SEL="" AUTHOR="" YEAR=""
-STRICT="" GIT=1 BENCH=0 BARE_REMOTE="" GENERATOR=auto STD_SET=0
+STRICT="" GIT=1 BENCH=0 BARE_REMOTE="" GENERATOR=auto STD_SET=0 STD_BARE="" BUILD_SEL=""
 IDENT="" CRATE=""
 
 norm_lang() {
@@ -1087,35 +1110,58 @@ EOF
 }
 
 init_resolve() {
+  local ans="" pre=""
   ask LANG_SEL "Language (c | cpp | rust | c-cpp-mixed)" cpp
-  LANG_SEL=$(norm_lang "$LANG_SEL") || die "$E_USAGE" "invalid --lang (use c | cpp | rust | c-cpp-mixed)"
+  pre=$LANG_SEL
+  LANG_SEL=$(norm_lang "$pre") || die "$E_USAGE" "invalid --lang '$pre' (use c | cpp | rust | c-cpp-mixed)"
   if [[ $LANG_SEL == rust ]]; then
     TESTFW=cargo
   else
     if ((!STD_SET)) && [[ -t 0 && -t 2 ]] && ((!YES)); then
-      case $LANG_SEL in
-        c) read -r -p "C standard (11|17|23) [17]: " ans || ans=""; C_STD=${ans:-17} ;;
-        *) read -r -p "C++ standard (17|20|23) [20]: " ans || ans=""; CXX_STD=${ans:-20} ;;
+      case $LANG_SEL in c | mixed)
+        while true; do
+          read -r -p "C standard (11|17|23) [17]: " ans || ans=""
+          C_STD=${ans:-17}
+          if [[ $C_STD =~ ^(11|17|23)$ ]]; then break; fi
+          err "unsupported C standard '$C_STD' (use 11, 17 or 23)"
+        done
+        ;;
+      esac
+      case $LANG_SEL in cpp | mixed)
+        while true; do
+          read -r -p "C++ standard (17|20|23) [20]: " ans || ans=""
+          CXX_STD=${ans:-20}
+          if [[ $CXX_STD =~ ^(17|20|23)$ ]]; then break; fi
+          err "unsupported C++ standard '$CXX_STD' (use 17, 20 or 23)"
+        done
+        ;;
       esac
     fi
     ask TESTFW "Test framework (ctest | catch2 | doctest | gtest | none)" ctest
-    TESTFW=$(norm_test "$TESTFW") || die "$E_USAGE" "invalid --test"
-    if [[ $TESTFW == cargo ]]; then die "$E_USAGE" "--test cargo only applies to --lang rust"; fi
+    pre=$TESTFW
+    TESTFW=$(norm_test "$pre") || die "$E_USAGE" "invalid --test '$pre' (use ctest | catch2 | doctest | gtest | none)"
+    if [[ $TESTFW == cargo ]]; then die "$E_USAGE" "--test cargo only applies to --lang rust (pick ctest | catch2 | doctest | gtest | none)"; fi
   fi
   ask LICENSE_SEL "License (mit | apache2 | bsd3 | gpl3 | none)" mit
-  LICENSE_SEL=$(norm_license "$LICENSE_SEL") || die "$E_USAGE" "invalid --license"
+  pre=$LICENSE_SEL
+  LICENSE_SEL=$(norm_license "$pre") || die "$E_USAGE" "invalid --license '$pre' (use mit | apache2 | bsd3 | gpl3 | none)"
   if [[ -z $STRICT ]]; then
     local s=""
     ask s "Strict warnings -Wall -Wextra -Wpedantic -Werror? (y/n)" n
     case ${s,,} in y | yes) STRICT=1 ;; *) STRICT=0 ;; esac
   fi
-  # NOTE: --std sets both C_STD and CXX_STD at parse time; validate only the
-  # language(s) actually used, otherwise e.g. --std 20 fails for C++ projects.
+  # NOTE: a bare --std sets CXX_STD always and C_STD only when valid for C
+  # (see parse_args); validate only the language(s) actually used.
   case $LANG_SEL in
-    c) [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23)" ;;
+    c)
+      if [[ -n $STD_BARE && ! $STD_BARE =~ ^(11|17|23)$ ]]; then
+        die "$E_USAGE" "--std $STD_BARE does not apply to C (use 11, 17 or 23, e.g. --c-std 17)"
+      fi
+      [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23)"
+      ;;
     cpp) [[ $CXX_STD =~ ^(17|20|23)$ ]] || die "$E_USAGE" "unsupported C++ standard: $CXX_STD (use 17, 20 or 23)" ;;
     mixed)
-      [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23)"
+      [[ $C_STD =~ ^(11|17|23)$ ]] || die "$E_USAGE" "unsupported C standard: $C_STD (use 11, 17 or 23; e.g. --std 20 --c-std 17)"
       [[ $CXX_STD =~ ^(17|20|23)$ ]] || die "$E_USAGE" "unsupported C++ standard: $CXX_STD (use 17, 20 or 23)"
       ;;
   esac
@@ -1124,14 +1170,27 @@ init_resolve() {
     CRATE=$(printf '%s' "$INIT_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | tr -s '-')
     CRATE=${CRATE#-}
     CRATE=${CRATE%-}
-    [[ $CRATE =~ ^[a-z] ]] || die "$E_USAGE" "crate name must start with a letter: '$INIT_NAME'"
+    [[ $CRATE =~ ^[a-z] ]] || die "$E_USAGE" "crate name must start with a letter: '$INIT_NAME' (override with --name NAME)"
+    case $CRATE in
+      as | break | const | continue | crate | else | enum | extern | false | fn | for | if | impl | in | let | loop | match | mod | move | mut | pub | ref | return | self | static | struct | super | trait | true | type | unsafe | use | where | while | async | await | dyn | try)
+        die "$E_USAGE" "crate name '$CRATE' is a Rust keyword; choose another with --name NAME"
+        ;;
+    esac
     IDENT=${CRATE//-/_}
   else
-    IDENT=$(make_ident "$INIT_NAME") || die "$E_USAGE" "cannot derive a valid identifier from '$INIT_NAME'"
+    IDENT=$(make_ident "$INIT_NAME") || die "$E_USAGE" "cannot derive a valid identifier from '$INIT_NAME' (override with --name NAME)"
+    if [[ $LANG_SEL != c ]]; then
+      case $IDENT in
+        alignas | alignof | asm | auto | bool | break | case | catch | char | char8_t | char16_t | char32_t | class | concept | const | consteval | constexpr | constinit | const_cast | continue | co_await | co_return | co_yield | decltype | default | delete | do | double | dynamic_cast | else | enum | explicit | export | extern | false | float | for | friend | goto | if | inline | int | long | mutable | namespace | new | noexcept | nullptr | operator | private | protected | public | register | reinterpret_cast | requires | return | short | signed | sizeof | static | static_assert | static_cast | struct | switch | template | this | thread_local | throw | true | try | typedef | typeid | typename | union | unsigned | using | virtual | void | volatile | wchar_t | while)
+          die "$E_USAGE" "derived identifier '$IDENT' is a C++ keyword and would not compile; choose another with --name NAME"
+          ;;
+      esac
+    fi
   fi
   AUTHOR=${AUTHOR:-$(git config --get user.name 2>/dev/null || true)}
   AUTHOR=${AUTHOR:-${USER:-author}}
   YEAR=${YEAR:-$(date +%Y)}
+  [[ $YEAR =~ ^[0-9]{4}(-[0-9]{4})?$ ]] || die "$E_USAGE" "invalid --year '$YEAR' (use YYYY, e.g. 2024)"
 }
 
 init_tokens() {
@@ -1766,9 +1825,6 @@ FetchContent_Declare(doctest
 FetchContent_MakeAvailable(doctest)
 ```
 EOF
-  if ((BENCH)); then
-    :
-  fi
 }
 
 init_cmake() {
@@ -1935,8 +1991,14 @@ init_git() {
     info "already inside a git work tree; not creating a repository or commit"
     return 0
   fi
-  git -C "$ROOT" init -q -b main 2>/dev/null || git -C "$ROOT" init -q
-  git -C "$ROOT" add -A
+  if ! git -C "$ROOT" init -q -b main 2>/dev/null && ! git -C "$ROOT" init -q; then
+    warn "could not initialise a git repository in $ROOT; continuing without version control (run 'git init' there manually)"
+    return 0
+  fi
+  if ! git -C "$ROOT" add -A; then
+    warn "git add failed in $ROOT; continuing without an initial commit (run 'git add -A && git commit' there manually)"
+    return 0
+  fi
   git -C "$ROOT" config --get user.name >/dev/null 2>&1 || idc+=(-c user.name=zide)
   git -C "$ROOT" config --get user.email >/dev/null 2>&1 || idc+=(-c user.email=zide@localhost)
   if git -C "$ROOT" "${idc[@]}" commit -q -m "chore: initial scaffold (zide $ZIDE_VERSION)"; then
@@ -1960,7 +2022,10 @@ init_bare_remote() {
     dry "git init --bare $remote + post-receive hook"
     return 0
   fi
-  git init -q --bare "$remote"
+  if ! git init -q --bare "$remote"; then
+    warn "could not create a bare repository at $remote ($(install_hint git)); continuing without a remote"
+    return 0
+  fi
   mk_tmp
   cat >"$TMP_LAST" <<'EOF'
 #!/usr/bin/env bash
@@ -1978,11 +2043,21 @@ EOF
 }
 
 cmd_init() {
-  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "init: missing <project-path>"
-  ROOT=$(safe_path "$POS_PATH")
+  [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "init: missing <project-path>. Usage: zide init <project-path> --lang <c | cpp | rust> -y"
+  ROOT=$(safe_path "$POS_PATH") || exit "$?"
   if [[ -e $ROOT && ! -d $ROOT ]]; then die "$E_REFUSED" "target exists and is not a directory: $ROOT"; fi
   init_resolve
   init_tokens
+  if [[ -n $BUILD_SEL ]]; then
+    case $LANG_SEL in
+      rust)
+        [[ $BUILD_SEL == cargo ]] || die "$E_USAGE" "init: --build $BUILD_SEL clashes with --lang rust (Rust always uses cargo); drop --build"
+        ;;
+      *)
+        [[ $BUILD_SEL == cmake ]] || die "$E_USAGE" "init: --build $BUILD_SEL clashes with --lang $LANG_SEL (C/C++ always uses CMake); drop --build"
+        ;;
+    esac
+  fi
   if [[ -d $ROOT && -n $(find "$ROOT" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     info "target is not empty: existing files are preserved (differing ones are kept unless --force)"
   fi
@@ -2215,7 +2290,7 @@ wiz_apply() { # <command-function> <project-root>
 }
 
 wizard_init() {
-  local default_author
+  local default_author pre=""
   wiz_restore
   ui_section "New project"
   while true; do
@@ -2227,11 +2302,18 @@ wizard_init() {
     info "directory is not empty: existing files are preserved unless you allow replacing them"
   fi
   if [[ -z $INIT_NAME ]]; then ui_input INIT_NAME "Project name" "$(basename -- "$ROOT")"; fi
+  if [[ -n $LANG_SEL ]]; then
+    pre=$LANG_SEL
+    if ! LANG_SEL=$(norm_lang "$pre"); then
+      warn "ignoring invalid pre-filled language '$pre' (use c | cpp | mixed | rust); please choose"
+      LANG_SEL=""
+    fi
+  fi
   if [[ -z $LANG_SEL ]]; then
     ui_choose LANG_SEL "Language" cpp \
       "cpp|C++" "c|C" "mixed|C and C++ in one project" "rust|Rust (cargo)"
+    LANG_SEL=$(norm_lang "$LANG_SEL") # menu values are always valid
   fi
-  LANG_SEL=$(norm_lang "$LANG_SEL") || die "$E_USAGE" "invalid language"
   if ((!STD_SET)); then
     case $LANG_SEL in c | mixed)
       ui_choose C_STD "C standard" "$C_STD" "17|C17" "11|C11" "23|C23"
@@ -2247,13 +2329,29 @@ wizard_init() {
     TESTFW=cargo
   elif [[ $LANG_SEL == c ]]; then
     TESTFW=ctest
-  elif [[ -z $TESTFW ]]; then
-    ui_choose TESTFW "Test framework" ctest \
-      "ctest|CTest smoke test (no dependencies)" \
-      "catch2|Catch2  (used only if installed system-wide)" \
-      "doctest|doctest  (used only if installed system-wide)" \
-      "gtest|GoogleTest  (used only if installed system-wide)" \
-      "none|No tests"
+  else
+    if [[ -n $TESTFW ]]; then
+      pre=$TESTFW
+      if ! TESTFW=$(norm_test "$pre"); then
+        warn "ignoring invalid pre-filled test framework '$pre'; please choose"
+        TESTFW=""
+      fi
+    fi
+    if [[ -z $TESTFW ]]; then
+      ui_choose TESTFW "Test framework" ctest \
+        "ctest|CTest smoke test (no dependencies)" \
+        "catch2|Catch2  (used only if installed system-wide)" \
+        "doctest|doctest  (used only if installed system-wide)" \
+        "gtest|GoogleTest  (used only if installed system-wide)" \
+        "none|No tests"
+    fi
+  fi
+  if [[ -n $LICENSE_SEL ]]; then
+    pre=$LICENSE_SEL
+    if ! LICENSE_SEL=$(norm_license "$pre"); then
+      warn "ignoring invalid pre-filled license '$pre'; please choose"
+      LICENSE_SEL=""
+    fi
   fi
   if [[ -z $LICENSE_SEL ]]; then
     ui_choose LICENSE_SEL "License" mit \
@@ -2402,7 +2500,8 @@ parse_args() {
           --year) YEAR=$v ;;
           --bare-remote) BARE_REMOTE=$v ;;
           --build | --build-system)
-            case ${v,,} in cmake | cargo) ;; *) die "$E_USAGE" "unsupported build system: $v (cmake|cargo)" ;; esac
+            BUILD_SEL=${v,,}
+            case $BUILD_SEL in cmake | cargo) ;; *) die "$E_USAGE" "unsupported build system: $v (use cmake | cargo)" ;; esac
             ;;
           --style)
             STYLE=${v,,}
@@ -2417,7 +2516,13 @@ parse_args() {
             case ${v,,} in
               c++*) CXX_STD=${v#*++} ;;
               c[0-9]*) C_STD=${v#[cC]} ;;
-              *) CXX_STD=$v C_STD=$v ;;
+              *)
+                # Bare N is primarily the C++ standard; adopt it for C only
+                # when it is also a valid C standard (else the C default stays).
+                STD_BARE=$v
+                CXX_STD=$v
+                case $v in 11 | 17 | 23) C_STD=$v ;; esac
+                ;;
             esac
             ;;
           --c-std)
