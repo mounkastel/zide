@@ -1,3 +1,5 @@
+[![CI](https://github.com/mounkastel/zide/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mounkastel/zide/actions/workflows/ci.yml)
+
 # zide
 
 One Bash script that gives **Zed** an IDE-grade setup for C, C++ and Rust projects.
