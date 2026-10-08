@@ -4,20 +4,24 @@ All notable changes to `zide` are recorded here. Versioning follows SemVer:
 no command or flag has been renamed; where observable behavior changed, it is
 listed under the release.
 
-## [2.2.0] — 2026-10-08
+## [3.0.0] — 2026-10-08
 
-### Changed (behavior change)
+### Breaking changes
 
 * `adopt` no longer executes project code by default: no CMake configure,
-  no Meson setup, no `compiledb`/`bear` run. `compile_commands.json` is
-  produced only with the new `--configure` opt-in (or when you configure
-  the build yourself and re-run `adopt`).
+  no Meson setup, no `compiledb`/`bear` run. If you relied on implicit
+  configure (e.g. `zide adopt <path>` in CI to get `compile_commands.json`),
+  add `--configure`. (Shipped briefly as 2.2.0 during development; renamed
+  to 3.0.0 before any release because the default change is incompatible
+  under SemVer.)
 * New `--configure` flag for `adopt`. Before anything executes, zide prints
   `about to run (in <dir>): <exact command>`; the wizard asks first and
   defaults to "no".
 * `--no-configure` is retained and keeps working; for `adopt` it now means
   the same as the default. For `init` nothing changed (it still configures
   once, on files zide itself generated).
+* `compile_commands.json` is produced only with `--configure` (or when you
+  configure the build yourself and re-run `adopt`).
 
 ### Fixed
 

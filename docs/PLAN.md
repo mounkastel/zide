@@ -101,3 +101,16 @@ SC2016-literal and SC2018/19-ASCII-identifier false positives, if any remain).
   fixes, it goes in CHANGELOG with a determinism re-check — none is planned.
 - License/attribution. Duplicated-but-stable task/debug blocks (audit §5).
 - `shfmt` whole-file restyle (above). Full wizard step-back (above).
+
+## Addendum 2026-10-08: version 3.0.0 decision (hardening item 1)
+
+Chosen: **(b) release as 3.0.0 with a "Breaking changes" section.**
+Reasoning: the adopt default change (implicit configure → no execution) silently
+changes the output of existing `zide adopt` invocations — scripts and CI jobs that
+relied on getting `compile_commands.json` out of a bare `adopt` now get none.
+That is an incompatible behavior change under SemVer ("Major version … when you
+make incompatible API changes"), so 2.2.0 would understate it. The 2.2.0 number
+existed only in local development commits and was never released, so the
+CHANGELOG entry was renamed to `[3.0.0]` rather than stacked. Exit codes, flag
+names, and generated file formats are unchanged, so the blast radius is exactly
+the adopt-configure default; the remedy (`--configure`) is one flag.
