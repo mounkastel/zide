@@ -150,3 +150,7 @@ make fmt    # shfmt -w on tests/ (needs shfmt; skips gracefully if absent)
 ```
 
 See `docs/AUDIT.md` (pre-release audit) and `docs/PLAN.md` (design decisions).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
