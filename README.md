@@ -147,6 +147,10 @@ initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
   Re-running is a no-op (idempotent).
 * Refuses `/`, `$HOME` and system directories (including their subdirectories).
   All generated JSON is validated with `jq` when installed.
+* A leading `~` or `~/...` in path arguments and wizard prompts expands to
+  `$HOME` (so `zide init ~/src/x` scaffolds under your home); `~user` forms
+  are not expanded. A bare `~` refuses like `$HOME` itself, and with `HOME`
+  unset a `~` path fails instead of becoming relative.
 * Deterministic: same flags ⇒ byte-identical output (pin `--author`/`--year`
   for byte-identical licenses across machines/years).
 * `adopt` never executes project code (no CMake configure, no build) unless
