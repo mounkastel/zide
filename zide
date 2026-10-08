@@ -199,11 +199,34 @@ DOCTOR_REQUIRED=(cmake clangd git cargo rustc)
 DOCTOR_RECOMMENDED=(ninja jq clang-format clang-tidy rust-analyzer gdb)
 DOCTOR_OPTIONAL=(bear compiledb compdb meson lldb)
 DOC_MISS_ALL=() DOC_MISS_REQ=() DOC_COLOR=0
+DOC_PROJECT=""
+DOC_REQ=() DOC_REC=() DOC_OPT=()
+
+# doctor_tiers: build DOC_REQ/DOC_REC/DOC_OPT. With a project path, tracks the
+# project does not use are demoted to recommended (git stays required); build
+# configurators stay optional because configure itself is opt-in.
+doctor_tiers() {
+  local t
+  DOC_REQ=("${DOCTOR_REQUIRED[@]}")
+  DOC_REC=("${DOCTOR_RECOMMENDED[@]}")
+  DOC_OPT=("${DOCTOR_OPTIONAL[@]}")
+  if [[ -z $DOC_PROJECT ]]; then return 0; fi
+  DOC_REQ=()
+  DOC_REC=()
+  for t in "${DOCTOR_REQUIRED[@]}"; do
+    case $t in
+      cmake | clangd) if ((DETECT_C || DETECT_CPP)); then DOC_REQ+=("$t"); else DOC_REC+=("$t"); fi ;;
+      cargo | rustc) if ((DETECT_RUST)); then DOC_REQ+=("$t"); else DOC_REC+=("$t"); fi ;;
+      *) DOC_REQ+=("$t") ;;
+    esac
+  done
+  DOC_REC+=("${DOCTOR_RECOMMENDED[@]}")
+}
 
 tool_tier() {
   local t=$1 x
-  for x in "${DOCTOR_REQUIRED[@]}"; do if [[ $x == "$t" ]]; then printf 'required'; return 0; fi; done
-  for x in "${DOCTOR_RECOMMENDED[@]}"; do if [[ $x == "$t" ]]; then printf 'recommended'; return 0; fi; done
+  for x in "${DOC_REQ[@]}"; do if [[ $x == "$t" ]]; then printf 'required'; return 0; fi; done
+  for x in "${DOC_REC[@]}"; do if [[ $x == "$t" ]]; then printf 'recommended'; return 0; fi; done
   printf 'optional'
 }
 
@@ -245,10 +268,11 @@ doctor_summary() {
 }
 
 doctor_json() {
-  local t tier ver first=1
+  local t tier ver first=1 proj=null
   local -a miss=()
-  printf '{"zide":%s,"distro":%s,"tools":[' "$(jstr "$ZIDE_VERSION")" "$(jstr "$(pkg_family)")"
-  for t in "${DOCTOR_REQUIRED[@]}" "${DOCTOR_RECOMMENDED[@]}" "${DOCTOR_OPTIONAL[@]}"; do
+  if [[ -n $DOC_PROJECT ]]; then proj=$(jstr "$DOC_PROJECT"); fi
+  printf '{"zide":%s,"distro":%s,"project":%s,"tools":[' "$(jstr "$ZIDE_VERSION")" "$(jstr "$(pkg_family)")" "$proj"
+  for t in "${DOC_REQ[@]}" "${DOC_REC[@]}" "${DOC_OPT[@]}"; do
     tier=$(tool_tier "$t")
     if ((first)); then first=0; else printf ','; fi
     ver=$(tool_version "$t")
@@ -274,22 +298,35 @@ doctor_json() {
 }
 
 cmd_doctor() {
+  local t scope=""
+  DOC_PROJECT=""
+  if [[ -n ${POS_PATH:-} ]]; then
+    ROOT=$(safe_path "$POS_PATH") || exit "$?"
+    [[ -d $ROOT ]] || die "$E_USAGE" "doctor: not a directory: $ROOT. Pass a project path, or run bare 'zide doctor' for the global toolchain report"
+    scan_files
+    detect_languages
+    if ((!DETECT_C && !DETECT_CPP && !DETECT_RUST)); then
+      die "$E_USAGE" "doctor: no C, C++ or Rust sources found under $ROOT. Pass a project path, or run bare 'zide doctor'"
+    fi
+    DOC_PROJECT=$ROOT
+    scope=" for $ROOT"
+  fi
+  doctor_tiers
   if ((JSON_OUT)); then doctor_json; return $?; fi
-  local t
   DOC_MISS_ALL=() DOC_MISS_REQ=() DOC_COLOR=0
   # Rows go to stdout: colorize only when stdout is a TTY too (keeps pipes clean).
   if [[ -n $C_RESET && -t 1 ]]; then DOC_COLOR=1; fi
   if ((DOC_COLOR)); then
-    printf '%szide %s toolchain%s (distro: %s)\n' "$C_BOLD" "$ZIDE_VERSION" "$C_RESET" "$(pkg_family)"
+    printf '%szide %s toolchain%s%s (distro: %s)\n' "$C_BOLD" "$ZIDE_VERSION" "$scope" "$C_RESET" "$(pkg_family)"
   else
-    printf 'zide %s toolchain (distro: %s)\n' "$ZIDE_VERSION" "$(pkg_family)"
+    printf 'zide %s toolchain%s (distro: %s)\n' "$ZIDE_VERSION" "$scope" "$(pkg_family)"
   fi
   printf '\nrequired:\n'
-  for t in "${DOCTOR_REQUIRED[@]}"; do doctor_row "$t" required; done
+  for t in "${DOC_REQ[@]}"; do doctor_row "$t" required; done
   printf '\nrecommended:\n'
-  for t in "${DOCTOR_RECOMMENDED[@]}"; do doctor_row "$t" recommended; done
+  for t in "${DOC_REC[@]}"; do doctor_row "$t" recommended; done
   printf '\noptional:\n'
-  for t in "${DOCTOR_OPTIONAL[@]}"; do doctor_row "$t" optional; done
+  for t in "${DOC_OPT[@]}"; do doctor_row "$t" optional; done
   printf '\n'
   doctor_summary
   if ((${#DOC_MISS_REQ[@]})); then return 1; fi
@@ -2247,7 +2284,7 @@ $PROG $ZIDE_VERSION - Zed IDE setup for C, C++ and Rust projects
 Usage:
   $PROG [options] adopt <path>   retrofit a project (never breaks your build)
   $PROG [options] init <path>    scaffold a project that builds and tests
-  $PROG doctor [--json]          toolchain report (exit 1 if required tools miss)
+  $PROG doctor [--json] [path]   toolchain report, scoped to the project if given
   $PROG -i [adopt|init] [path]   guided wizard (default when run in a terminal)
 
 Run control:

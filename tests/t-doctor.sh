@@ -37,3 +37,33 @@ else
   tap_not_ok "--json lists 5 required tools"
 fi
 if ((jrc == expected)); then tap_ok "--json exit matches text exit"; else tap_not_ok "--json exit matches text exit"; fi
+
+# Per-project scope: tiers follow the detected languages.
+T=$(fresh_dir)
+track_tmp "$T"
+mkdir -p -- "$T/rustonly/src"
+printf '[package]\nname = "scoped"\nversion = "0.1.0"\n' >"$T/rustonly/Cargo.toml"
+printf 'pub fn add(a: i32, b: i32) -> i32 { a + b }\n' >"$T/rustonly/src/lib.rs"
+mkdir -p -- "$T/conly"
+printf 'int main(void) { return 0; }\n' >"$T/conly/main.c"
+if ! have_tool jq; then tap_skip "per-project tiers" "jq not installed"; else
+  tier_cmake_rust=$("$ZIDE" doctor --json "$T/rustonly" 2>/dev/null | jq -r '.tools[] | select(.name=="cmake") | .tier')
+  tier_cargo_rust=$("$ZIDE" doctor --json "$T/rustonly" 2>/dev/null | jq -r '.tools[] | select(.name=="cargo") | .tier')
+  if [[ $tier_cmake_rust == recommended && $tier_cargo_rust == required ]]; then
+    tap_ok "rust project: cmake recommended, cargo required"
+  else
+    tap_not_ok "rust project: cmake recommended, cargo required"
+  fi
+  tier_cargo_c=$("$ZIDE" doctor --json "$T/conly" 2>/dev/null | jq -r '.tools[] | select(.name=="cargo") | .tier')
+  tier_cmake_c=$("$ZIDE" doctor --json "$T/conly" 2>/dev/null | jq -r '.tools[] | select(.name=="cmake") | .tier')
+  if [[ $tier_cargo_c == recommended && $tier_cmake_c == required ]]; then
+    tap_ok "c project: cargo recommended, cmake required"
+  else
+    tap_not_ok "c project: cargo recommended, cmake required"
+  fi
+  proj=$("$ZIDE" doctor --json "$T/conly" 2>/dev/null | jq -r '.project')
+  if [[ $proj == "$T/conly" ]]; then tap_ok "--json reports the scoped project"; else tap_not_ok "--json reports the scoped project"; fi
+fi
+"$ZIDE" doctor /nonexistent-zide-probe-xyz >/dev/null 2>&1
+rc=$?
+if ((rc == 2)); then tap_ok "doctor bad path exits 2"; else tap_not_ok "doctor bad path exits 2 (got $rc)"; fi
