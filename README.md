@@ -9,7 +9,7 @@ One Bash script that gives **Zed** an IDE-grade setup for C, C++ and Rust projec
 ```sh
 git clone https://github.com/mounkastel/zide.git && cd zide
 make install   # installs to ~/.local/bin/zide
-zide --version # 3.0.0
+zide --version # 3.1.0
 ```
 
 Make sure `~/.local/bin` is on your `PATH`
