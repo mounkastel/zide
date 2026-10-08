@@ -36,6 +36,7 @@ VERBOSE=0
 FORCE=0
 YES=0
 COLOR=auto
+JSON_OUT=0
 
 # --------------------------------------------------------------------------
 # Logging
@@ -156,13 +157,18 @@ install_hint() {
 }
 
 tool_version() {
-  local out
+  local out rc=0
   if ! have "$1"; then
     printf 'missing'
     return 0
   fi
-  out=$({ "$1" --version 2>&1 || true; } | sed -n '1p')
-  printf '%s' "${out:-unknown}"
+  out=$("$1" --version 2>&1) || rc=$?
+  out=$(printf '%s\n' "$out" | sed -n '1p')
+  if ((rc)); then
+    printf 'broken (%s)' "${out:-exit $rc}"
+  else
+    printf '%s' "${out:-unknown}"
+  fi
 }
 
 # need_tool <tool> <required:0|1> <why>
@@ -187,14 +193,106 @@ print_toolchain() {
   done
 }
 
-cmd_doctor() {
-  printf '%szide %s toolchain report%s (distro family: %s)\n' "$C_BOLD" "$ZIDE_VERSION" "$C_RESET" "$(pkg_family)"
-  print_toolchain
-  local t
-  printf '\nInstall hints for missing tools:\n'
-  for t in cmake ninja clangd clang-format clang-tidy git jq bear gdb lldb cargo rust-analyzer; do
-    if ! have "$t"; then printf '  %-14s %s\n' "$t" "$(install_hint "$t")"; fi
+# Doctor groups. "required" gates the exit code (each one blocks at least one
+# default flow); "recommended" degrades gracefully; "optional" is situational.
+DOCTOR_REQUIRED=(cmake clangd git cargo rustc)
+DOCTOR_RECOMMENDED=(ninja jq clang-format clang-tidy rust-analyzer gdb)
+DOCTOR_OPTIONAL=(bear compiledb compdb meson lldb)
+DOC_MISS_ALL=() DOC_MISS_REQ=() DOC_COLOR=0
+
+tool_tier() {
+  local t=$1 x
+  for x in "${DOCTOR_REQUIRED[@]}"; do if [[ $x == "$t" ]]; then printf 'required'; return 0; fi; done
+  for x in "${DOCTOR_RECOMMENDED[@]}"; do if [[ $x == "$t" ]]; then printf 'recommended'; return 0; fi; done
+  printf 'optional'
+}
+
+doc_line() { # <ok|miss> <tool> <detail> <tier>
+  if ((DOC_COLOR)); then
+    local color=$C_GREEN
+    if [[ $1 == miss ]]; then
+      if [[ $4 == required ]]; then color=$C_RED; else color=$C_YELLOW; fi
+    fi
+    printf '  %s%-4s%s %-12s %s\n' "$color" "$1" "$C_RESET" "$2" "$3"
+  else
+    printf '  %-4s %-12s %s\n' "$1" "$2" "$3"
+  fi
+}
+
+doctor_row() { # <tool> <tier>
+  local tool=$1 tier=$2 ver
+  ver=$(tool_version "$tool")
+  case $ver in
+    missing | broken*)
+      DOC_MISS_ALL+=("$tool")
+      if [[ $tier == required ]]; then DOC_MISS_REQ+=("$tool"); fi
+      doc_line miss "$tool" "$ver -> $(install_hint "$tool")" "$tier"
+      ;;
+    *)
+      doc_line ok "$tool" "$ver" "$tier"
+      ;;
+  esac
+}
+
+doctor_summary() {
+  local n=${#DOC_MISS_ALL[@]} m=${#DOC_MISS_REQ[@]} what="things"
+  if ((n == 0)); then
+    printf 'summary: ready\n'
+    return 0
+  fi
+  if ((n == 1)); then what="thing"; fi
+  printf 'summary: %d %s to fix (%d required): %s\n' "$n" "$what" "$m" "$(join_by ', ' "${DOC_MISS_ALL[@]}")"
+}
+
+doctor_json() {
+  local t tier ver first=1
+  local -a miss=()
+  printf '{"zide":%s,"distro":%s,"tools":[' "$(jstr "$ZIDE_VERSION")" "$(jstr "$(pkg_family)")"
+  for t in "${DOCTOR_REQUIRED[@]}" "${DOCTOR_RECOMMENDED[@]}" "${DOCTOR_OPTIONAL[@]}"; do
+    tier=$(tool_tier "$t")
+    if ((first)); then first=0; else printf ','; fi
+    ver=$(tool_version "$t")
+    case $ver in
+      missing | broken*)
+        printf '{"name":%s,"tier":%s,"present":false,"detail":%s}' "$(jstr "$t")" "$(jstr "$tier")" "$(jstr "$ver")"
+        if [[ $tier == required ]]; then miss+=("$t"); fi
+        ;;
+      *)
+        printf '{"name":%s,"tier":%s,"present":true,"version":%s}' "$(jstr "$t")" "$(jstr "$tier")" "$(jstr "$ver")"
+        ;;
+    esac
   done
+  printf '],"missing_required":['
+  first=1
+  for t in "${miss[@]}"; do
+    if ((first)); then first=0; else printf ','; fi
+    printf '%s' "$(jstr "$t")"
+  done
+  if ((${#miss[@]})); then printf '],"ready":false}\n'; return 1; fi
+  printf '],"ready":true}\n'
+  return 0
+}
+
+cmd_doctor() {
+  if ((JSON_OUT)); then doctor_json; return $?; fi
+  local t
+  DOC_MISS_ALL=() DOC_MISS_REQ=() DOC_COLOR=0
+  # Rows go to stdout: colorize only when stdout is a TTY too (keeps pipes clean).
+  if [[ -n $C_RESET && -t 1 ]]; then DOC_COLOR=1; fi
+  if ((DOC_COLOR)); then
+    printf '%szide %s toolchain%s (distro: %s)\n' "$C_BOLD" "$ZIDE_VERSION" "$C_RESET" "$(pkg_family)"
+  else
+    printf 'zide %s toolchain (distro: %s)\n' "$ZIDE_VERSION" "$(pkg_family)"
+  fi
+  printf '\nrequired:\n'
+  for t in "${DOCTOR_REQUIRED[@]}"; do doctor_row "$t" required; done
+  printf '\nrecommended:\n'
+  for t in "${DOCTOR_RECOMMENDED[@]}"; do doctor_row "$t" recommended; done
+  printf '\noptional:\n'
+  for t in "${DOCTOR_OPTIONAL[@]}"; do doctor_row "$t" optional; done
+  printf '\n'
+  doctor_summary
+  if ((${#DOC_MISS_REQ[@]})); then return 1; fi
   return 0
 }
 
@@ -243,9 +341,19 @@ backup_file() {
   fi
 }
 
+# Dry-run previews (stderr, capped): what a create/patch would write.
+dry_preview_new() { # <tmp>
+  local n
+  n=$(wc -l <"$1")
+  head -n 12 "$1" | sed 's/^/    + /' >&2
+  if ((n > 12)); then printf '    + ... (%d more lines)\n' "$((n - 12))" >&2; fi
+}
+dry_preview_diff() { # <old> <new> <rel>
+  diff -u --label "a/$3" --label "b/$3" -- "$1" "$2" 2>/dev/null | head -n 24 | sed 's/^/    /' >&2 || true
+}
+
 # commit_file <src> <dest> <mode> <allow_modify:0|1>
-commit_file() {
-  local src=$1 dest=$2 mode=$3 allow=${4:-0} r
+commit_file() {  local src=$1 dest=$2 mode=$3 allow=${4:-0} r
   r=$(rel "$dest")
   if [[ -e $dest || -L $dest ]]; then
     if [[ -f $dest && ! -L $dest ]] && cmp -s -- "$src" "$dest"; then
@@ -260,12 +368,13 @@ commit_file() {
       return 0
     fi
     backup_file "$dest"
-    if ((DRY_RUN)); then dry "update $r"; else install -m "$mode" -- "$src" "$dest"; fi
+    if ((DRY_RUN)); then dry "update $r"; dry_preview_diff "$dest" "$src" "$r"; else install -m "$mode" -- "$src" "$dest"; fi
     UPDATED+=("$r")
     return 0
   fi
   if ((DRY_RUN)); then
     dry "create $r"
+    dry_preview_new "$src"
   else
     mkdir -p -- "$(dirname -- "$dest")"
     install -m "$mode" -- "$src" "$dest"
@@ -360,7 +469,7 @@ put_block() { # <dest> <block-body>
     local r
     r=$(rel "$dest")
     backup_file "$dest"
-    if ((DRY_RUN)); then dry "patch $r"; else install -m 644 -- "$TMP_LAST" "$dest"; fi
+    if ((DRY_RUN)); then dry "patch $r"; dry_preview_diff "$dest" "$TMP_LAST" "$r"; else install -m 644 -- "$TMP_LAST" "$dest"; fi
     UPDATED+=("$r (managed block)")
     return 0
   fi
@@ -408,13 +517,16 @@ try_run() { # <description> <cmd...>
   mk_tmp
   log=$TMP_LAST
   TMP_LAST=$prev_tmp
-  info "$desc"
+  info "running: $desc"
+  local start=$SECONDS took=0
   "$@" >"$log" 2>&1 || rc=$?
+  took=$((SECONDS - start))
   if ((rc)); then
-    warn "$desc failed (exit $rc); last output:"
+    warn "$desc failed after ${took}s (exit $rc); last output:"
     tail -n 8 "$log" | sed 's/^/        /' >&2
     return 1
   fi
+  if ((VERBOSE)); then info "$desc finished in ${took}s"; fi
   return 0
 }
 
@@ -763,7 +875,13 @@ add_library(${ident}_core"$'\n'
 adopt_compdb() {
   local gen=() db
   if ((!DETECT_C && !DETECT_CPP)); then return 0; fi
-  if have ninja; then gen=(-G Ninja); fi
+  if ((!NO_CONFIGURE)); then
+    case $CC_BUILD in
+      cmake | meson)
+        info "generating compile_commands.json runs the project's '$CC_BUILD' configure step (project files execute; --no-configure to skip)"
+        ;;
+    esac
+  fi
   case $CC_BUILD in
     cmake)
       BUILD_DIR=build/zide PRESET=""
@@ -912,20 +1030,24 @@ print_report() {
   local title=$1 x
   local dr=""
   if ((DRY_RUN)); then dr=" (dry run: nothing written)"; fi
-  printf '\n%s%s%s%s\n' "$C_BOLD" "$title" "$dr" "$C_RESET"
-  printf '  project : %s\n' "$ROOT"
-  if [[ $title == *adoption* ]]; then
-    printf '  languages: %s\n  build   : %s (primary C/C++: %s)\n' "$(langs_label)" "${BUILDS[*]:-none}" "$CC_BUILD"
-  fi
-  printf '  created : %d\n' "${#CREATED[@]}"
-  for x in "${CREATED[@]}"; do printf '      + %s\n' "$x"; done
-  printf '  modified: %d\n' "${#UPDATED[@]}"
-  for x in "${UPDATED[@]}"; do printf '      ~ %s\n' "$x"; done
-  printf '  unchanged: %d   kept (yours): %d   backups: %d   warnings: %d\n' \
-    "${#UNCHANGED[@]}" "${#KEPT[@]}" "${#BACKUPS[@]}" "${#WARNINGS[@]}"
-  for x in "${KEPT[@]}"; do printf '      = %s\n' "$x"; done
-  printf '  toolchain:\n'
-  print_toolchain
+  # Reports are human chatter: everything goes to stderr (stdout stays data-only).
+  {
+    printf '\n%s%s%s%s\n' "$C_BOLD" "$title" "$dr" "$C_RESET"
+    printf '  project : %s\n' "$ROOT"
+    if [[ $title == *adoption* ]]; then
+      printf '  languages: %s\n  build   : %s (primary C/C++: %s)\n' "$(langs_label)" "${BUILDS[*]:-none}" "$CC_BUILD"
+    fi
+    printf '  created : %d\n' "${#CREATED[@]}"
+    for x in "${CREATED[@]}"; do printf '      + %s\n' "$x"; done
+    printf '  updated : %d\n' "${#UPDATED[@]}"
+    for x in "${UPDATED[@]}"; do printf '      ~ %s\n' "$x"; done
+    printf '  unchanged: %d   kept (yours): %d   backups: %d   warnings: %d\n' \
+      "${#UNCHANGED[@]}" "${#KEPT[@]}" "${#BACKUPS[@]}" "${#WARNINGS[@]}"
+    for x in "${KEPT[@]}"; do printf '      = %s\n' "$x"; done
+    for x in "${BACKUPS[@]}"; do printf '      b %s\n' "$x"; done
+    printf '  toolchain:\n'
+    print_toolchain
+  } >&2
 }
 
 cmd_adopt() {
@@ -981,7 +1103,7 @@ cmd_adopt() {
   put_block "$ROOT/.gitignore" "$(gitignore_body)"
   ok "adoption finished"
   print_report "Post-adoption report"
-  printf '\nNext steps:\n  1. zed %q\n  2. Command palette -> "task: spawn" -> configure, build, test\n  3. If compile_commands.json is missing, run the "configure" task, then "editor: restart language server".\n' "$ROOT"
+  printf '\nNext steps:\n  1. zed %q\n  2. Command palette -> "task: spawn" -> configure, build, test\n  3. If compile_commands.json is missing, run the "configure" task, then "editor: restart language server".\n' "$ROOT" >&2
 }
 
 # --------------------------------------------------------------------------
@@ -2013,7 +2135,7 @@ init_bare_remote() {
   local remote
   remote=$(safe_path "$BARE_REMOTE")
   if [[ -e $remote ]]; then
-    [[ -d $remote ]] || die "$E_REFUSED" "bare remote path is not a directory: $remote"
+    [[ -d $remote ]] || die "$E_REFUSED" "bare remote path is not a directory: $remote (pass an empty directory to --bare-remote)"
     if [[ -n $(find "$remote" -mindepth 1 -maxdepth 1 -print -quit) ]] && ((!FORCE)); then
       die "$E_REFUSED" "bare remote path is not empty (use --force): $remote"
     fi
@@ -2045,7 +2167,7 @@ EOF
 cmd_init() {
   [[ -n ${POS_PATH:-} ]] || die "$E_USAGE" "init: missing <project-path>. Usage: zide init <project-path> --lang <c | cpp | rust> -y"
   ROOT=$(safe_path "$POS_PATH") || exit "$?"
-  if [[ -e $ROOT && ! -d $ROOT ]]; then die "$E_REFUSED" "target exists and is not a directory: $ROOT"; fi
+  if [[ -e $ROOT && ! -d $ROOT ]]; then die "$E_REFUSED" "target exists and is not a directory: $ROOT (pick another path)"; fi
   init_resolve
   init_tokens
   if [[ -n $BUILD_SEL ]]; then
@@ -2084,9 +2206,9 @@ cmd_init() {
   ok "scaffold finished"
   print_report "Scaffold report"
   if [[ $LANG_SEL == rust ]]; then
-    printf '\nNext steps:\n  cd %q && cargo test && cargo run && zed .\n' "$ROOT"
+    printf '\nNext steps:\n  cd %q && cargo test && cargo run && zed .\n' "$ROOT" >&2
   else
-    printf '\nNext steps:\n  cd %q\n  cmake --preset dev && cmake --build --preset dev && ctest --preset dev\n  zed .\n' "$ROOT"
+    printf '\nNext steps:\n  cd %q\n  cmake --preset dev && cmake --build --preset dev && ctest --preset dev\n  zed .\n' "$ROOT" >&2
   fi
 }
 
@@ -2095,57 +2217,55 @@ cmd_init() {
 # --------------------------------------------------------------------------
 usage() {
   cat <<EOF
-$PROG $ZIDE_VERSION - IDE-grade Zed setup for native (C / C++ / Rust) projects
+$PROG $ZIDE_VERSION - Zed IDE setup for C, C++ and Rust projects
 
-USAGE
-  $PROG                                   interactive wizard (when run in a terminal)
-  $PROG -i [adopt|init] [path]            interactive wizard, optionally pre-selecting the mode/path
-  $PROG [options] adopt  <project-path>   retrofit an existing project, non-destructively
-  $PROG [options] init   <project-path>   scaffold a new project that builds and tests out of the box
-  $PROG doctor                            show toolchain status and install hints
+Usage:
+  $PROG [options] adopt <path>   retrofit a project (never breaks your build)
+  $PROG [options] init <path>    scaffold a project that builds and tests
+  $PROG doctor [--json]          toolchain report (exit 1 if required tools miss)
+  $PROG -i [adopt|init] [path]   guided wizard (default when run in a terminal)
 
-GLOBAL OPTIONS
-  -v, --verbose          verbose logging
-  -n, --dry-run          show what would change; write and run nothing
-  -f, --force            replace files that differ from the templates (backed up as *.bak.<UTC>)
-  -i, --interactive      guided wizard: menus, questions, summary, preview, apply
-  -y, --yes              never prompt; use defaults for anything not given
-      --no-color         disable colours (NO_COLOR is honoured too)
-  -h, --help             this help
-      --version          print the version
+Run control:
+  -n, --dry-run    plan only: list actions and show diffs, change nothing
+  -f, --force      replace differing files (originals kept as *.bak.<UTC>)
+  -y, --yes        never prompt; take defaults for anything not passed
+  -v, --verbose    extra detail (and internal locations on failure)
+  --no-color       plain output (NO_COLOR is honoured too)
 
-ADOPT OPTIONS
-      --no-cmake         never generate a CMakeLists.txt
-      --no-configure     do not run cmake/meson/bear/compiledb
-      --std N            C++ (17|20|23) / C (11|17|23) standard for a generated CMakeLists.txt
-      --style S          clang-format base style: llvm (default) | mozilla | google
+adopt:
+  --build B        drive only this build system: cmake | cargo
+  --no-cmake       never generate a CMakeLists.txt
+  --no-configure   skip configure (no compile_commands.json is produced)
+  --std N          standard for a generated CMakeLists (C++ 17|20|23, C 11|17|23)
+  --style S        clang-format base: llvm | mozilla | google
 
-INIT OPTIONS (anything omitted is asked interactively, or defaulted with -y / no TTY)
-      --name NAME        project name (default: directory name)
-      --lang L           c | cpp | rust | c-cpp-mixed                    (default: cpp)
-      --std N | --c-std N   C++ standard 17|20|23 (default 20) / C standard 11|17|23 (default 17)
-      --test T           ctest | catch2 | doctest | gtest | none         (default: ctest)
-                         catch2/doctest/gtest are used only if installed system-wide
-      --license L        mit | apache2 | bsd3 | gpl3 | none              (default: mit)
-      --author NAME      license holder (default: git user.name)
-      --year YYYY        license year (default: current)
-      --strict           -Wall -Wextra -Wpedantic -Werror (clippy/rustc deny for Rust)
-      --benchmarks       add benchmarks/ (dependency-free)
-      --style S          clang-format base style: llvm | mozilla | google
-      --generator G      auto | ninja | make                              (default: auto)
-      --no-git           skip git init and the initial commit
-      --bare-remote DIR  create a bare repo at DIR with a post-receive stub; add it as 'origin'
-      --no-configure     skip the initial 'cmake --preset dev'
+init:
+  --lang L         c | cpp | rust | c-cpp-mixed              (default: cpp)
+  --build B        must agree with --lang: cmake | cargo
+  --std N          C++ standard 17|20|23 (also used for C if 11|17|23)
+  --c-std N        C standard 11|17|23                      (default: 17)
+  --test T         ctest | catch2 | doctest | gtest | none   (default: ctest)
+  --license L      mit | apache2 | bsd3 | gpl3 | none        (default: mit)
+  --name N         project name          (default: directory name)
+  --author N       license holder        (default: git user.name)
+  --year YYYY      license year          (default: current year)
+  --strict         -Wall -Wextra -Wpedantic -Werror (deny warnings for Rust)
+  --benchmarks     add a benchmarks/ target (opt-in)
+  --generator G    CMake generator: auto | ninja | make    (default: auto)
+  --style S        clang-format base: llvm | mozilla | google
+  --no-git         skip git init and the initial commit
+  --bare-remote D  bare repo at D with a post-receive stub, added as 'origin'
+  --no-configure   skip the initial 'cmake --preset dev'
+  (aliases: --language, --test-framework; --git / --no-bench negate --no-git / --benchmarks)
 
-EXAMPLES
-  $PROG --dry-run -v adopt ~/src/legacy
-  $PROG adopt ~/src/mylib --style mozilla
-  $PROG init ~/src/fastcalc --lang cpp --std 20 --strict --test doctest
-  $PROG init ~/src/packetd --lang c --std 17 --license apache2 --benchmarks
-  $PROG init ./bridge --lang c-cpp-mixed -y
+Examples:
+  $PROG adopt ~/src/legacy --dry-run
+  $PROG init ~/src/fastcalc --lang cpp --std 20 --strict --test doctest -y
+  $PROG init ./bridge --lang c-cpp-mixed --benchmarks -y
 
-EXIT CODES
-  0 ok   1 failure   2 usage   3 invalid generated JSON   4 refused unsafe operation
+Exit codes: 0 ok, 1 failure, 2 usage, 3 bad generated JSON, 4 refused, 130 interrupted.
+Safety: differing files are kept unless --force (then backed up); .zed/*.json are
+merged (your keys win); --dry-run writes nothing; system paths are refused.
 EOF
 }
 
@@ -2177,7 +2297,7 @@ ui_input() {
   local -n _ui_ref=$1
   local ans=""
   printf '%s?%s %s\n' "$C_CYAN" "$C_RESET" "$2" >&2
-  read -r -e -p "  > " -i "$3" ans || die 130 "input closed"
+  read -r -e -p "  > " -i "$3" ans || die 130 "input closed; wizard cancelled"
   _ui_ref=${ans:-$3}
 }
 
@@ -2187,7 +2307,7 @@ ui_confirm() {
   if [[ $def == y ]]; then hint="Y/n"; else hint="y/N"; fi
   while true; do
     printf '%s?%s %s [%s] ' "$C_CYAN" "$C_RESET" "$q" "$hint" >&2
-    IFS= read -rsn1 ans || die 130 "input closed"
+    IFS= read -rsn1 ans || die 130 "input closed; wizard cancelled"
     case ${ans,,} in
       y) printf 'yes\n' >&2; return 0 ;;
       n) printf 'no\n' >&2; return 1 ;;
@@ -2225,7 +2345,7 @@ ui_choose() {
         printf '    %s\033[K\n' "${labels[i]}" >&2
       fi
     done
-    IFS= read -rsn1 key || { printf '\033[?25h' >&2; die 130 "input closed"; }
+    IFS= read -rsn1 key || { printf '\033[?25h' >&2; die 130 "input closed; wizard cancelled"; }
     if [[ $key == $'\033' ]]; then
       rest=""
       read -rsn2 -t 0.05 rest || true
@@ -2301,7 +2421,7 @@ wizard_init() {
   if [[ -d $ROOT && -n $(find "$ROOT" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     info "directory is not empty: existing files are preserved unless you allow replacing them"
   fi
-  if [[ -z $INIT_NAME ]]; then ui_input INIT_NAME "Project name" "$(basename -- "$ROOT")"; fi
+  while [[ -z $INIT_NAME ]]; do ui_input INIT_NAME "Project name" "$(basename -- "$ROOT")"; done
   if [[ -n $LANG_SEL ]]; then
     pre=$LANG_SEL
     if ! LANG_SEL=$(norm_lang "$pre"); then
@@ -2422,7 +2542,7 @@ wizard_adopt() {
 
 cmd_wizard() {
   local action=$POS_CMD
-  [[ -t 0 && -t 2 ]] || die "$E_USAGE" "interactive mode needs a terminal"
+  [[ -t 0 && -t 2 ]] || die "$E_USAGE" "interactive mode needs a terminal (run non-interactively instead, e.g. zide init ./my-project --lang cpp -y)"
   YES=1
   wiz_snapshot
   ui_banner
@@ -2440,7 +2560,7 @@ cmd_wizard() {
       adopt) wizard_adopt ;;
       doctor) cmd_doctor ;;
       quit) return 0 ;;
-      *) die "$E_USAGE" "unknown command: $action" ;;
+      *) die "$E_USAGE" "unknown wizard command '$action' (choose init | adopt | doctor)" ;;
     esac
     action=""
     printf '\n' >&2
@@ -2460,7 +2580,7 @@ parse_args() {
       case $pos in
         1) POS_CMD=$a ;;
         2) POS_PATH=$a ;;
-        *) die "$E_USAGE" "unexpected argument: $a" ;;
+        *) die "$E_USAGE" "unexpected argument '$a' (usage: zide [options] <adopt|init|doctor> <path>; see zide --help)" ;;
       esac
       continue
     fi
@@ -2478,6 +2598,7 @@ parse_args() {
       -y | --yes) YES=1 ;;
       -i | --interactive) INTERACTIVE=1 ;;
       --no-color) COLOR=never ;;
+      --json) JSON_OUT=1 ;; # machine-readable output (currently: doctor only)
       --no-cmake) NO_CMAKE=1 ;;
       --no-configure) NO_CONFIGURE=1 ;;
       --strict) STRICT=1 ;;
@@ -2487,7 +2608,7 @@ parse_args() {
       --no-git) GIT=0 ;;
       --name | --lang | --language | --std | --c-std | --test | --test-framework | --license | --author | --year | --style | --generator | --bare-remote | --build | --build-system)
         if ((!eq)); then
-          ((i < ${#args[@]})) || die "$E_USAGE" "missing value for $a"
+          ((i < ${#args[@]})) || die "$E_USAGE" "missing value for $a (usage: $a VALUE; see zide --help)"
           v=${args[i]}
           i=$((i + 1))
         fi
@@ -2505,11 +2626,11 @@ parse_args() {
             ;;
           --style)
             STYLE=${v,,}
-            case $STYLE in llvm | mozilla | google) ;; *) die "$E_USAGE" "unknown --style: $v" ;; esac
+            case $STYLE in llvm | mozilla | google) ;; *) die "$E_USAGE" "unknown --style '$v' (use llvm | mozilla | google)" ;; esac
             ;;
           --generator)
             GENERATOR=${v,,}
-            case $GENERATOR in auto | ninja | make) ;; *) die "$E_USAGE" "unknown --generator: $v" ;; esac
+            case $GENERATOR in auto | ninja | make) ;; *) die "$E_USAGE" "unknown --generator '$v' (use auto | ninja | make)" ;; esac
             ;;
           --std)
             STD_SET=1
@@ -2531,7 +2652,7 @@ parse_args() {
             ;;
         esac
         ;;
-      *) die "$E_USAGE" "unknown option: $a (see --help)" ;;
+      *) die "$E_USAGE" "unknown option '$a' (see: zide --help)" ;;
     esac
   done
 }
@@ -2551,7 +2672,7 @@ main() {
     doctor) cmd_doctor ;;
     help) usage ;;
     "") usage >&2; exit "$E_USAGE" ;;
-    *) die "$E_USAGE" "unknown command: $POS_CMD (adopt | init | doctor)" ;;
+    *) die "$E_USAGE" "unknown command '$POS_CMD'. Run one of: zide adopt <path> | zide init <path> | zide doctor (see zide --help)" ;;
   esac
 }
 
