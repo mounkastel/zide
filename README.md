@@ -8,62 +8,108 @@ zide init  <path>   scaffold a new project that builds, tests and runs immediate
 zide doctor         toolchain report with per-distro install hints (apt/dnf/pacman/zypper)
 ```
 
-Requirements: Bash 5+, Linux. Optional: `cmake ninja clangd clang-format jq git bear|compiledb gdb|lldb cargo rust-analyzer`.
-No network access is ever used.
+Requirements: Bash 5+, Linux, GNU coreutils. Optional tools (all degrade gracefully
+when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
+meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
 
-## Interactive mode
+## Install
+
+```sh
+install -m 0755 zide ~/.local/bin/zide
+# equivalent: make install   (PREFIX defaults to ~/.local)
+```
+
+## Quick start
+
+```sh
+zide init ~/src/fastcalc --lang cpp --std 20 --strict --test doctest -y
+cd ~/src/fastcalc && cmake --preset dev && cmake --build --preset dev && ctest --preset dev
+zed .
+
+zide adopt ~/src/legacy --dry-run   # preview the plan (with diffs) first
+zide adopt ~/src/legacy
+
+zide doctor                         # grouped report + "ready" / "N things to fix"
+zide doctor --json | jq .           # machine-readable variant
+```
+
+Interactive mode (arrow-key menus, preview before apply, nothing is written until
+you confirm):
 
 ```sh
 zide              # in a terminal: starts the wizard
 zide -i           # same, explicitly
 zide -i init ./x  # wizard pre-filled with the mode / path
 ```
-The wizard asks only what is relevant (arrow-key menus, `Tab` completes paths), shows a summary, and lets you
-**Preview** (dry-run) before **Apply**. Anything you already passed as a flag is not asked again. Afterwards it can
-open the project in Zed.
 
-## Install
+## Flags
 
-```sh
-install -m 0755 zide ~/.local/bin/zide
-```
+Full reference: `zide --help` (one screen). The most used:
 
-## Safety model
+| Flag | Meaning |
+|------|---------|
+| `-n, --dry-run` | plan only: list actions and show diffs, change nothing |
+| `-f, --force` | replace differing files (originals kept as `*.bak.<UTC>`) |
+| `-y, --yes` | never prompt; take defaults for anything not passed |
+| `-v, --verbose` | extra detail (and internal locations on failure) |
+| `--no-color` | plain output (`NO_COLOR` is honoured too) |
+| `--lang L` | `init`: `c \| cpp \| rust \| c-cpp-mixed` (default: `cpp`) |
+| `--build B` | `adopt`: drive only `cmake \| cargo`; `init`: must agree with `--lang` |
+| `--std N`, `--c-std N` | C++ (`17\|20\|23`, default 20) / C (`11\|17\|23`, default 17) standard |
+| `--test T` | `ctest \| catch2 \| doctest \| gtest \| none` (default: `ctest`; external frameworks are used only if installed system-wide, otherwise a smoke test) |
+| `--license L` | `mit \| apache2 \| bsd3 \| gpl3 \| none` (default: `mit`) |
+| `--strict` | `-Wall -Wextra -Wpedantic -Werror` (warnings denied for Rust) |
+| `--benchmarks` | add a `benchmarks/` target (opt-in) |
+| `--generator G` | CMake generator: `auto \| ninja \| make` (default: `auto`) |
+| `--style S` | clang-format base: `llvm \| mozilla \| google` |
+| `--no-git` | skip `git init` and the initial commit |
+| `--bare-remote D` | bare repo at `D` with a post-receive stub, added as `origin` |
+| `--no-configure` | skip running the build system (no `compile_commands.json`) |
+| `--no-cmake` | `adopt`: never generate a `CMakeLists.txt` |
+| `--json` | `doctor`: machine-readable report on stdout |
 
-* Existing files that differ from a template are **kept**; `--force` replaces them and first saves `*.bak.<UTC timestamp>`.
-* `.zed/settings.json` is **merged** (your keys win); `tasks.json` / `debug.json` get missing entries added by `label`.
-  Files containing comments (JSONC) are left alone unless `--force`.
+Exit codes: `0` ok, `1` failure, `2` usage, `3` bad generated JSON, `4` refused
+unsafe operation, `130` interrupted. `doctor` exits `1` when a *required* tool
+(`cmake clangd git cargo rustc`) is missing or broken.
+
+## What gets written to disk
+
+`adopt <path>` (existing project):
+
+* `.zed/settings.json` — **merged** (your keys win), `.zed/tasks.json` /
+  `.zed/debug.json` — missing entries added by `label`.
+* `.clangd`, `.clang-format` (`--style`), `.clang-tidy`.
+* `.gitignore` — one managed block (`# >>> zide >>>`); your lines are untouched.
+* CMake projects: configures (`dev` preset if present, else `build/zide`) and
+  symlinks `compile_commands.json` to the root. Your `CMakeLists.txt` is never
+  modified. No build system at all: generates a reviewable `CMakeLists.txt`
+  from the sources (`--no-cmake` to skip). Make: `compiledb -n make`, or
+  `bear -- make -B` (a real build). Meson: `meson setup`. Bazel: a hint only.
+
+`init <path>` (new project): `CMakeLists.txt`, `CMakePresets.json`
+(`dev`/`release`/`asan`/`ubsan`/`tsan`), `include/<name>/`, `src/`, `tests/`,
+`benchmarks/` (opt-in), `cmake/`, `scripts/{build,run,format,sanitize}.sh`,
+`third_party/`, `.zed/`, clang configs, `LICENSE`, and a git repo with an
+initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
+`tests/`, `rustfmt.toml`, helper scripts, `.zed/`.
+
+## Safety guarantees
+
+* Existing files that differ from a template are **kept**; `--force` replaces
+  them and first saves `*.bak.<UTC timestamp>`.
+* `.zed/settings.json` is **merged** (your keys win); `tasks.json` / `debug.json`
+  get missing entries added by `label`. Files containing comments (JSONC) are
+  left alone unless `--force`.
 * `.gitignore` gets one managed block (`# >>> zide >>>`), your lines are untouched.
-* `--dry-run` prints every action and writes/executes nothing. Re-running is a no-op (idempotent).
-* Refuses `/`, `$HOME` and system directories. All generated JSON is validated with `jq` when installed.
-* Deterministic: same flags => byte-identical output (license year via `--year`).
-
-## adopt
-
-Detects C / C++ / Rust and CMake / Meson / Make / Bazel / Cargo, then:
-
-* CMake: exports `compile_commands.json` (preset `dev` if present, else `build/zide`) and symlinks it to the repo root.
-  Your `CMakeLists.txt` is never modified.
-* No build system at all: generates a reviewable `CMakeLists.txt` from the sources (`--no-cmake` to skip).
-* Make: `compiledb -n make` (no build) or `bear -- make -B`. Meson: `meson setup`. Bazel: a hint only.
-* Writes `.zed/{settings,tasks,debug}.json`, `.clangd`, `.clang-format` (`--style llvm|mozilla|google`), `.clang-tidy`.
-* Prints a report: created / modified / kept files, backups, toolchain versions, next steps.
-
-## init
-
-```sh
-zide init ~/src/fastcalc --lang cpp --std 20 --strict --test doctest
-zide init ~/src/packetd  --lang c   --std 17 --license apache2 --benchmarks
-zide init ~/src/bridge   --lang c-cpp-mixed -y
-zide init ~/src/agent    --lang rust --strict
-```
-
-Layout: `CMakeLists.txt`, `CMakePresets.json` (dev, release, asan, ubsan, tsan), `include/<name>/`, `src/`, `tests/`,
-`benchmarks/` (opt-in), `cmake/`, `scripts/{build,run,format,sanitize}.sh`, `third_party/`, `.zed/`, clang configs, LICENSE, git repo.
-
-`cmake --preset dev && cmake --build --preset dev && ctest --preset dev` passes out of the box.
-Catch2 / doctest / GoogleTest are used if installed system-wide; otherwise the same test falls back to a built-in smoke test.
-Apache-2.0 and GPL-3 texts are copied from `/usr/share/common-licenses` when present (otherwise a short notice with the URL).
+* `--dry-run` prints every action (with diffs) and writes/executes nothing.
+  Re-running is a no-op (idempotent).
+* Refuses `/`, `$HOME` and system directories (including their subdirectories).
+  All generated JSON is validated with `jq` when installed.
+* Deterministic: same flags ⇒ byte-identical output (pin `--author`/`--year`
+  for byte-identical licenses across machines/years).
+* Generating `compile_commands.json` runs your build system's configure step
+  (project build files execute); `--no-configure` skips it. stdout stays
+  data-only (`zide doctor | grep` works); all human output goes to stderr.
 
 ## Verify the Zed setup
 
@@ -73,7 +119,19 @@ readlink compile_commands.json
 clangd --check=src/main.cpp          # use your main source file
 zed .
 ```
-In Zed: `task: spawn` lists configure/build/clean/rebuild/test/run; `debugger: start` offers CodeLLDB and GDB profiles;
-`dev: open language server logs` should show clangd; saving a mis-indented file reformats it via `.clang-format`.
 
-Exit codes: 0 ok, 1 failure, 2 usage, 3 invalid generated JSON, 4 refused unsafe operation.
+In Zed: `task: spawn` lists configure/build/clean/rebuild/test/run;
+`debugger: start` offers CodeLLDB and GDB profiles;
+`dev: open language server logs` should show clangd; saving a mis-indented
+file reformats it via `.clang-format`.
+
+## Tests
+
+```sh
+make test   # full matrix (builds real projects; missing toolchains skip with a reason)
+make lint   # shellcheck -x (needs shellcheck; skips gracefully if absent)
+make fmt    # shfmt -w on tests/ (needs shfmt; skips gracefully if absent)
+./tests/run.sh   # same as make test
+```
+
+See `docs/AUDIT.md` (pre-release audit) and `docs/PLAN.md` (design decisions).

@@ -1,0 +1,59 @@
+# Changelog
+
+All notable changes to `zide` are recorded here. Versioning follows SemVer:
+no command or flag has been renamed; where observable behavior changed, it is
+listed under the release.
+
+## [2.1.0] — 2026-10-08
+
+### Added
+
+* `doctor`: tools grouped into required / recommended / optional, per-tool
+  install hints for every missing tool, `summary: ready` (or
+  `N things to fix (M required)`), and `--json` machine-readable output.
+* `--dry-run` (and the wizard preview) now shows capped unified diffs and
+  content previews, not just action names.
+* `--build` / `--build-system` is honored: `adopt` drives only the selected
+  build system (and errors when its files are absent); `init` validates it
+  against `--lang`.
+* Regression suite: `tests/` (plain-bash TAP harness, no new dependencies)
+  plus a `Makefile` with `test`, `lint`, `fmt` and `install` targets.
+
+### Changed
+
+* `doctor` exits `1` when a required tool (`cmake clangd git cargo rustc`)
+  is missing or broken (previously always `0`).
+* Final reports and `Next steps` go to stderr; `doctor` stays on stdout, so
+  `zide doctor | grep` keeps working. Report vocabulary is now uniform:
+  `created / updated / unchanged / kept / backups`, and backup paths are listed.
+* `safe_path` refuses subdirectories of system roots (`/usr/...`, `/etc/...`),
+  not just the exact paths.
+* `--help` rewritten as a one-screen grouped reference covering every flag.
+* Every error message states what happened, why, and the next command or flag.
+* Adopted CMake projects with a `dev` preset now get `--preset`-style
+  build/test tasks (previously directory-style).
+* A bare `--std N` sets the C++ standard and adopts it for C only when valid
+  for C (previously `mixed --std 20` died).
+* `try_run` progress lines read `running: …` and failures report elapsed time.
+* `adopt`/`init` announce before running project build files to produce
+  `compile_commands.json` (`--no-configure` skips this).
+
+### Fixed
+
+* Dry-run reports no longer count backups that were never taken.
+* Absolute `compile_commands.json` symlinks no longer corrupt build-dir reuse.
+* `init` validates `--year`, rejects Rust keywords as crate names and C++
+  keywords as derived identifiers (both produced projects that do not build).
+* `git init` / `git add` / bare-remote failures warn and continue instead of
+  aborting with an internal trace.
+* Internal failure locations (`file:line`) are only shown with `--verbose`.
+* Filenames with newlines no longer corrupt project scanning.
+* Invalid pre-filled wizard values re-prompt instead of aborting the wizard.
+
+### Deliberately unchanged
+
+* Single-file layout kept (see `docs/PLAN.md` for the rationale).
+* `.gitignore` managed block and `.zed/*.json` merging still apply without
+  `--force` (merge-class behavior, now documented).
+* Auto-configure stays on by default; per-step wizard Back-navigation deferred.
+* Whole-file `shfmt` restyle declined (mechanical churn, no user gain).
