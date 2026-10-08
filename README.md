@@ -2,6 +2,26 @@
 
 One Bash script that gives **Zed** an IDE-grade setup for C, C++ and Rust projects.
 
+## Install
+
+```sh
+git clone https://github.com/mounkastel/zide.git && cd zide
+make install   # installs to ~/.local/bin/zide
+zide --version # 3.0.0
+```
+
+Make sure `~/.local/bin` is on your `PATH`
+(`export PATH="$HOME/.local/bin:$PATH"`). To install elsewhere, point
+`PREFIX` at it: `make install PREFIX=/usr/local` (use `sudo` only when the
+target directory needs it).
+
+No git? Install straight from the script (same file, no installer):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mounkastel/zide/main/zide -o ~/.local/bin/zide
+chmod +x ~/.local/bin/zide
+```
+
 ```
 zide adopt <path>   retrofit an existing project (never breaks your build)
 zide init  <path>   scaffold a new project that builds, tests and runs immediately
@@ -11,13 +31,6 @@ zide doctor         toolchain report with per-distro install hints (apt/dnf/pacm
 Requirements: Bash 5+ (verified on 5.0 and 5.3 via `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
 when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
 meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
-
-## Install
-
-```sh
-install -m 0755 zide ~/.local/bin/zide
-# equivalent: make install   (PREFIX defaults to ~/.local)
-```
 
 ## Quick start
 
