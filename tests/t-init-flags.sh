@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# init: flag handling — license/year, benchmarks, invalid values, protected paths.
+# init: flag handling: license/year, benchmarks, invalid values, protected paths.
 set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

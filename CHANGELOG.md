@@ -15,21 +15,15 @@ listed under the release.
 
 ### Added
 
-* A leading `~` or `~/...` in path arguments (`adopt`/`init`
-  `<project-path>`, `--bare-remote`, `doctor [path]`) and in wizard path
-  prompts expands to `$HOME` before anything else runs. `~user` forms are not
-  expanded and are handled as literal paths. A bare `~` therefore refuses
-  with exit 4, exactly as `$HOME` itself does; when `HOME` is unset or empty,
-  `~` paths fail with exit 2 and a clear message instead of falling back to
-  a relative path. The wizard summary and the final reports show the expanded
-  absolute path.
+* A leading `~` or `~/...` in path arguments and wizard path prompts
+  expands to `$HOME`. `~user` forms stay literal. A bare `~` is refused
+  with exit 4 like `$HOME`; with `HOME` unset or empty, `~` paths fail
+  with exit 2. Reports show the expanded absolute path.
 
 ### Fixed
 
-* Wizard text prompts show the default as a hint (`Project directory
-  [./my-project]:`) and start with an empty input buffer. Pressing Enter on
-  an empty buffer still accepts the default, and typed text replaces the
-  default entirely instead of being appended to pre-filled text.
+* Wizard text prompts show the default as a hint and start with an empty
+  input buffer. Enter accepts the default, and typed text replaces it.
 
 ## [3.0.0] — 2026-10-08
 
@@ -38,9 +32,7 @@ listed under the release.
 * `adopt` no longer executes project code by default: no CMake configure,
   no Meson setup, no `compiledb`/`bear` run. If you relied on implicit
   configure (e.g. `zide adopt <path>` in CI to get `compile_commands.json`),
-  add `--configure`. (Shipped briefly as 2.2.0 during development; renamed
-  to 3.0.0 before any release because the default change is incompatible
-  under SemVer.)
+  add `--configure`.
 * New `--configure` flag for `adopt`. Before anything executes, zide prints
   `about to run (in <dir>): <exact command>`; the wizard asks first and
   defaults to "no".
@@ -110,8 +102,7 @@ listed under the release.
 
 ### Deliberately unchanged
 
-* Single-file layout kept (see `docs/PLAN.md` for the rationale).
+* Single-file layout kept.
 * `.gitignore` managed block and `.zed/*.json` merging still apply without
-  `--force` (merge-class behavior, now documented).
-* Auto-configure stays on by default; per-step wizard Back-navigation deferred.
-* Whole-file `shfmt` restyle declined (mechanical churn, no user gain).
+  `--force`.
+* No per-step wizard Back navigation; no whole-file `shfmt` restyle.

@@ -2,7 +2,7 @@
 
 # zide
 
-One Bash script that gives **Zed** an IDE-grade setup for C, C++ and Rust projects.
+One Bash script that sets up Zed for C, C++ and Rust projects.
 
 ## Install
 
@@ -52,7 +52,7 @@ zide init  <path>   scaffold a new project that builds, tests and runs immediate
 zide doctor         toolchain report with per-distro install hints (apt/dnf/pacman/zypper)
 ```
 
-Requirements: Bash 5+ (verified on 5.0 and 5.3 via `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
+Requirements: Bash 5+ (tested with 5.0 and 5.3 via `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
 when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
 meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
 
@@ -115,10 +115,10 @@ unsafe operation, `130` interrupted. `doctor` exits `1` when a *required* tool
 
 `adopt <path>` (existing project):
 
-* `.zed/settings.json` — **merged** (your keys win), `.zed/tasks.json` /
-  `.zed/debug.json` — missing entries added by `label`.
+* `.zed/settings.json`: merged (your keys win). `.zed/tasks.json` and
+  `.zed/debug.json`: missing entries added by `label`.
 * `.clangd`, `.clang-format` (`--style`), `.clang-tidy`.
-* `.gitignore` — one managed block (`# >>> zide >>>`); your lines are untouched.
+* `.gitignore`: one managed block (`# >>> zide >>>`); your lines are untouched.
 * CMake projects: with `--configure`, configures (`dev` preset if present,
   else `build/zide`) and symlinks `compile_commands.json` to the root;
   without it, no `compile_commands.json` is produced (re-run with
@@ -137,34 +137,18 @@ initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
 
 ## Safety guarantees
 
-* Existing files that differ from a template are **kept**; `--force` replaces
-  them and first saves `*.bak.<UTC timestamp>`.
-* `.zed/settings.json` is **merged** (your keys win); `tasks.json` / `debug.json`
-  get missing entries added by `label`. Files containing comments (JSONC) are
-  left alone unless `--force`.
-* `.gitignore` gets one managed block (`# >>> zide >>>`), your lines are untouched.
-* `--dry-run` prints every action (with diffs) and writes/executes nothing.
-  Re-running is a no-op (idempotent).
-* Refuses `/`, `$HOME` and system directories (including their subdirectories).
-  All generated JSON is validated with `jq` when installed.
-* A leading `~` or `~/...` in path arguments and wizard prompts expands to
-  `$HOME` (so `zide init ~/src/x` scaffolds under your home); `~user` forms
-  are not expanded. A bare `~` refuses like `$HOME` itself, and with `HOME`
-  unset a `~` path fails instead of becoming relative.
-* Deterministic: same flags ⇒ byte-identical output (pin `--author`/`--year`
-  for byte-identical licenses across machines/years).
-* `adopt` never executes project code (no CMake configure, no build) unless
-  you pass `--configure`; the exact command is announced before it runs.
-  `--no-configure` is retained for compatibility (with a one-line deprecation
-  warning on `adopt`) and means the same as the default. (`init` still
-  configures once, on files zide itself generated.)
-* Without `compile_commands.json`, clangd in Zed has degraded code
-  intelligence (no accurate includes, defines, or jump-to-definition).
-  Generate the database with `zide adopt --configure <path>`, or configure
-  the build yourself and re-run `adopt`.
-* Generating `compile_commands.json` with `--configure` runs your build
-  system's configure step (project build files execute). stdout stays
-  data-only (`zide doctor | grep` works); all human output goes to stderr.
+* Existing files that differ from a template are kept, unless `--force` replaces them after saving a `*.bak.<UTC timestamp>` copy.
+* `.zed/settings.json` is merged with your keys winning, `tasks.json` and `debug.json` gain missing entries by `label`, and files with comments (JSONC) are left alone unless `--force` is passed.
+* `.gitignore` gains one managed block (`# >>> zide >>>`) while your lines stay untouched.
+* `--dry-run` prints every action with diffs and writes nothing, so re-running is a no-op.
+* Paths under `/`, `$HOME`, and system directories are refused, and generated JSON is checked with `jq` when it is installed.
+* A leading `~` or `~/...` in path arguments and wizard prompts expands to `$HOME`, `~user` forms stay literal, a bare `~` is refused like `$HOME`, and a `~` path with `HOME` unset fails instead of becoming relative.
+* Output is deterministic for the same flags when `--author` and `--year` are pinned.
+* `adopt` runs no project code unless `--configure` is passed, and the exact command is printed before it runs.
+* `--no-configure` on `adopt` means the same as the default and prints a one-line deprecation warning, while `init` still configures once on files zide generated.
+* Without `compile_commands.json`, clangd in Zed lacks accurate includes, defines, and jump-to-definition, so run `zide adopt --configure <path>` or configure the build and re-run `adopt`.
+* `--configure` executes the build system configure step, so project build files run.
+* Stdout carries data only (`zide doctor | grep` works) and all human output goes to stderr.
 
 ## Verify the Zed setup
 
@@ -190,8 +174,8 @@ make fmt    # shfmt -w on tests/ (needs shfmt; skips gracefully if absent)
 ./tests/run.sh   # same as make test
 ```
 
-See `docs/AUDIT.md` (pre-release audit) and `docs/PLAN.md` (design decisions).
+Design background is in `docs/DESIGN.md`. Open items are tracked in the [issue tracker](https://github.com/mounkastel/zide/issues).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
