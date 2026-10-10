@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/run.sh — minimal TAP runner: executes tests/t-*.sh, tallies results.
+# tests/run.sh: minimal TAP runner that executes tests/t-*.sh and tallies results.
 set -u
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

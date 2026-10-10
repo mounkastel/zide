@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/lib.sh — shared helpers for the zide test suite (TAP output, no deps).
+# tests/lib.sh: shared helpers for the zide test suite (TAP output, no deps).
 # Sourced by tests/t-*.sh. Requires bash 4+.
 set -u
 

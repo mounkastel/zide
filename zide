@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# zide - provision an IDE-grade Zed environment for native systems projects.
+# zide - set up a Zed environment for native systems projects.
 #
 #   zide adopt <project-path>   retrofit an existing project (non-destructive)
 #   zide init  <project-path>   scaffold a new, building, testable project
