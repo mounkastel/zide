@@ -26,7 +26,7 @@ if ((BASH_VERSINFO[0] < 5)); then
   exit 2
 fi
 
-readonly ZIDE_VERSION="1.3.0"
+readonly ZIDE_VERSION="1.4.0"
 readonly PROG="zide"
 readonly E_USAGE=2 E_JSON=3 E_REFUSED=4
 
@@ -674,40 +674,80 @@ zed_settings() { # has_c has_cpp has_rust
     "$(join_by $',\n' "${langs[@]}")" "$(join_by $',\n' "${lsp[@]}")"
 }
 
+# zide_run_text: helper run script; argv only, so task runners that join
+# command and args cannot split shell logic. A cache keeps its generator.
+zide_run_text() {
+  cat <<'EOF'
+#!/usr/bin/env bash
+# Run one CMake target: configure once, build it, exec it.
+# usage: scripts/zide-run.sh <target> [--preset <name>]
+set -euo pipefail
+
+if (($# < 1)); then
+  echo "usage: scripts/zide-run.sh <target> [--preset <name>]" >&2
+  exit 2
+fi
+target=$1
+preset=""
+if [[ ${2:-} == "--preset" ]]; then
+  preset=${3:-}
+  if [[ -z $preset ]]; then
+    echo "usage: scripts/zide-run.sh <target> [--preset <name>]" >&2
+    exit 2
+  fi
+fi
+
+dir=build/zide
+cfg=(cmake -S . -B "$dir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)
+build=(cmake --build "$dir")
+if [[ -n $preset ]]; then
+  dir="build/$preset"
+  cfg=(cmake --preset "$preset")
+  build=(cmake --build --preset "$preset")
+fi
+
+if [[ ! -f $dir/CMakeCache.txt ]]; then
+  if [[ -z $preset ]] && command -v ninja >/dev/null 2>&1; then
+    cfg+=(-G Ninja)
+  fi
+  "${cfg[@]}"
+fi
+"${build[@]}" --target "$target"
+exec "./$dir/$target"
+EOF
+}
+
 # tasks_cmake <preset|""> <build-dir> <use_preset_for_build:0|1> targets...
 tasks_cmake() {
   local preset=$1 dir=$2 usep=$3 t first=1
   shift 3
+  local -a run_args=()
+  if [[ -n $preset ]]; then run_args=(--preset "$preset"); fi
   local -a gen=()
   if have ninja; then gen=(-G Ninja); fi
-  # Configure on first use so build/run/rebuild work on a fresh checkout; re-running over a cache keeps already-set variables.
-  local cfg bld
+  # Run tasks configure on first use through scripts/zide-run.sh; re-running over a cache keeps already-set variables.
   if [[ -n $preset ]]; then
     add_task "configure" "" cmake --preset "$preset"
   else
     add_task "configure" "" cmake -S . -B "$dir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${gen[@]}"
   fi
   if ((usep)); then
-    cfg="[ -f $dir/CMakeCache.txt ] || cmake --preset $preset"
-    bld="cmake --build --preset $preset"
     add_task "build" on_success cmake --build --preset "$preset"
     add_task "clean" "" cmake --build --preset "$preset" --target clean
-    add_task "rebuild" on_success bash -c "$cfg && cmake --build --preset $preset --target clean && cmake --build --preset $preset"
+    add_task "rebuild" on_success cmake --build --preset "$preset" --clean-first
     add_task "test" on_success ctest --preset "$preset"
   else
-    cfg="[ -f $dir/CMakeCache.txt ] || cmake -S . -B $dir -DCMAKE_EXPORT_COMPILE_COMMANDS=ON${gen:+ ${gen[*]}}"
-    bld="cmake --build $dir"
     add_task "build" on_success cmake --build "$dir"
     add_task "clean" "" cmake --build "$dir" --target clean
-    add_task "rebuild" on_success bash -c "$cfg && cmake --build $dir --target clean && cmake --build $dir"
+    add_task "rebuild" on_success cmake --build "$dir" --clean-first
     add_task "test" on_success ctest --test-dir "$dir" --output-on-failure
   fi
   for t in "$@"; do
     if ((first)); then
-      add_task "run" "" bash -c "$cfg && $bld && exec ./$dir/$t"
+      add_task "run" "" ./scripts/zide-run.sh "$t" "${run_args[@]}"
       first=0
     fi
-    add_task "run: $t" "" bash -c "$cfg && $bld && exec ./$dir/$t"
+    add_task "run: $t" "" ./scripts/zide-run.sh "$t" "${run_args[@]}"
   done
 }
 
@@ -1131,9 +1171,10 @@ adopt_zed() {
         else
           tasks_cmake "" "$BUILD_DIR" 0 "${targets[@]}"
         fi
+        put_str "$ROOT/scripts/zide-run.sh" text 755 "$(zide_run_text)"
         for t in "${targets[@]}"; do
-          add_debug "Debug $t (CodeLLDB)" CodeLLDB "$BUILD_DIR/$t" build
-          add_debug "Debug $t (GDB)" GDB "$BUILD_DIR/$t" build
+          add_debug "Debug $t (CodeLLDB)" CodeLLDB "$BUILD_DIR/$t" "run: $t"
+          add_debug "Debug $t (GDB)" GDB "$BUILD_DIR/$t" "run: $t"
         done
         ;;
       meson)
@@ -2048,11 +2089,12 @@ EOF
 init_cmake_zed() {
   TASKS=() DEBUGS=()
   tasks_cmake dev build/dev 1 "$IDENT"
+  put_str "$ROOT/scripts/zide-run.sh" text 755 "$(zide_run_text)"
   add_task "build: release" on_success cmake --build --preset release
   add_task "sanitize: asan" "" bash scripts/sanitize.sh asan
   add_task "format" on_success bash scripts/format.sh
-  add_debug "Debug $IDENT (CodeLLDB)" CodeLLDB "build/dev/$IDENT" build
-  add_debug "Debug $IDENT (GDB)" GDB "build/dev/$IDENT" build
+  add_debug "Debug $IDENT (CodeLLDB)" CodeLLDB "build/dev/$IDENT" "run: $IDENT"
+  add_debug "Debug $IDENT (GDB)" GDB "build/dev/$IDENT" "run: $IDENT"
   local c=0 cpp=0
   case $LANG_SEL in c) c=1 ;; cpp) cpp=1 ;; mixed) c=1 cpp=1 ;; esac
   put_str "$ROOT/.zed/settings.json" json-object 644 "$(zed_settings "$c" "$cpp" 0)"
