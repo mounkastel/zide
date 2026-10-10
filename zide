@@ -26,7 +26,7 @@ if ((BASH_VERSINFO[0] < 5)); then
   exit 2
 fi
 
-readonly ZIDE_VERSION="1.2.0"
+readonly ZIDE_VERSION="1.3.0"
 readonly PROG="zide"
 readonly E_USAGE=2 E_JSON=3 E_REFUSED=4
 
@@ -909,7 +909,7 @@ entry_target() {
 # --------------------------------------------------------------------------
 # Mode 1: adopt
 # --------------------------------------------------------------------------
-NO_CMAKE=0 NO_CONFIGURE=0 CONFIGURE=0 NO_CONFIGURE_FLAG=0
+NO_CMAKE=0 NO_CONFIGURE=0 CONFIGURE=0 NO_CONFIGURE_FLAG=0 PLANNED_TARGETS=()
 C_STD=17 CXX_STD=20
 BUILD_DIR="" PRESET="" DB_DIR="."
 
@@ -974,6 +974,7 @@ add_library(${ident}_core"$'\n'
     fi
   done
   put_str "$ROOT/CMakeLists.txt" text 644 "$body"
+  PLANNED_TARGETS=("${targets[@]}")
   info "CMake targets: ${#mains[@]} (one per file with main())"
 }
 
@@ -1110,15 +1111,20 @@ adopt_zed() {
   name=$(basename -- "$ROOT")
   TASKS=() DEBUGS=()
   if ((DETECT_C || DETECT_CPP)); then
+    # In a dry run the generated CMakeLists.txt exists only as a plan;
+    # still plan its run/debug entries from the generated target list.
+    if ((DRY_RUN)) && ((${#PLANNED_TARGETS[@]})); then CC_BUILD=cmake; fi
     case $CC_BUILD in
       cmake)
         mapfile -t targets < <(cmake_exe_targets)
+        if ((DRY_RUN)) && ((${#PLANNED_TARGETS[@]})); then
+          targets=("${PLANNED_TARGETS[@]}")
+        fi
         if ((${#targets[@]} == 0)); then
           targets=("$(make_ident "$name" || echo app)")
           warn "no add_executable target detected; guessing binary name '${targets[0]}' (fix .zed/tasks.json if the binary is named differently)"
-        elif ((${#targets[@]} > 24)); then
-          warn "found ${#targets[@]} executables; generating run/debug entries for the first 24 (add the rest to .zed/tasks.json manually)"
-          targets=("${targets[@]:0:24}")
+        else
+          info "run/debug entries: ${#targets[@]} executable targets"
         fi
         if [[ -n $PRESET ]]; then
           tasks_cmake "$PRESET" "$BUILD_DIR" 1 "${targets[@]}"

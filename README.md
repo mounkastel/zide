@@ -113,7 +113,7 @@ unsafe operation, `130` interrupted. `doctor` exits `1` when a required tool
   Make: with `--configure`, `compiledb -n make`, or `bear -- make -B`
   (a real build). Meson: `meson setup`. Bazel: a hint only.
 
-When no build system is present, `adopt` generates a `CMakeLists.txt` with one executable target per file that defines `main()`, named after its relative path. A `CMakeLists.txt` that already exists is never modified; the report then states how many files with `main()` it builds and lists the ones it does not, using a textual check of file paths.
+When no build system is present, `adopt` generates a `CMakeLists.txt` with one executable target per file that defines `main()`, named after its relative path. A `CMakeLists.txt` that already exists is never modified; the report then states how many files with `main()` it builds and lists the ones it does not, using a textual check of file paths. Run and debug entries are created for every executable target.
 
 `init <path>` (new project): `CMakeLists.txt`, `CMakePresets.json`
 (`dev`/`release`/`asan`/`ubsan`/`tsan`), `include/<name>/`, `src/`, `tests/`,
