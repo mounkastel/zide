@@ -94,7 +94,7 @@ Full reference: `zide --help` (one screen). The most used:
 | `--json` | `doctor`: machine-readable report on stdout |
 
 Exit codes: `0` ok, `1` failure, `2` usage, `3` bad generated JSON, `4` refused
-unsafe operation, `130` interrupted. `doctor` exits `1` when a *required* tool
+unsafe operation, `130` interrupted. `doctor` exits `1` when a required tool
 (`cmake clangd git cargo rustc`) is missing or broken.
 
 ## What gets written to disk
