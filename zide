@@ -14,8 +14,7 @@
 #   * Every generated JSON file is validated with jq (when installed) before write.
 #   * Output is deterministic: same inputs => byte-identical files.
 #
-# Single-quoted literals below are generated file content (Zed JSON values such as
-# $ZED_WORKTREE_ROOT, bash -c payloads, CMake variables), never shell expansions.
+# Single-quoted literals below are generated file content (Zed JSON values, bash -c payloads, CMake variables), never shell expansions.
 # shellcheck disable=SC2016
 # tr ranges are ASCII-only on purpose: derived identifiers are ASCII by construction.
 # shellcheck disable=SC2018,SC2019
@@ -193,8 +192,7 @@ print_toolchain() {
   done
 }
 
-# Doctor groups. "required" gates the exit code (each one blocks at least one
-# default flow); "recommended" degrades gracefully; "optional" is situational.
+# Doctor groups: "required" gates the exit code; "recommended" degrades gracefully; "optional" is situational.
 DOCTOR_REQUIRED=(cmake clangd git cargo rustc)
 DOCTOR_RECOMMENDED=(ninja jq clang-format clang-tidy rust-analyzer gdb)
 DOCTOR_OPTIONAL=(bear compiledb compdb meson lldb)
@@ -202,9 +200,7 @@ DOC_MISS_ALL=() DOC_MISS_REQ=() DOC_COLOR=0
 DOC_PROJECT=""
 DOC_REQ=() DOC_REC=() DOC_OPT=()
 
-# doctor_tiers: build DOC_REQ/DOC_REC/DOC_OPT. With a project path, tracks the
-# project does not use are demoted to recommended (git stays required); build
-# configurators stay optional because configure itself is opt-in.
+# doctor_tiers: build DOC_REQ/DOC_REC/DOC_OPT; with a project path, tools for unused tracks are recommended (git stays required).
 doctor_tiers() {
   local t
   DOC_REQ=("${DOCTOR_REQUIRED[@]}")
@@ -342,13 +338,10 @@ CREATED=() UPDATED=() UNCHANGED=() KEPT=() BACKUPS=()
 
 rel() { printf '%s' "${1#"$ROOT"/}"; }
 
-# Expand a leading ~ or ~/ using $HOME. Only a bare ~ or ~/... is expanded;
-# ~user forms are left unchanged for the existing path checks to handle.
-# Fails with E_USAGE when HOME is unset or empty.
+# Expand a leading ~ or ~/... using $HOME (~user forms stay literal); fail with E_USAGE when HOME is unset or empty.
 expand_tilde() {
   local p=$1
-  # Quoted "~" patterns are intentional: only a literal leading ~ or ~/
-  # expands (a shell would have expanded an unquoted ~ before we see it).
+  # Quoted "~" patterns match a literal tilde; the shell expands an unquoted ~ before we see it.
   # shellcheck disable=SC2088
   case $p in
     '~' | '~/'*)
@@ -687,11 +680,7 @@ tasks_cmake() {
   shift 3
   local -a gen=()
   if have ninja; then gen=(-G Ninja); fi
-  # Self-healing prefix for the compound tasks: configure on first use so
-  # build/run/rebuild also work on a fresh checkout without running the
-  # "configure" task first. Re-running configure over an existing cache keeps
-  # already-set variables, and `cmake --build` re-runs it when CMake files
-  # changed, so the guard is only a first-run safety net.
+  # Configure on first use so build/run/rebuild work on a fresh checkout; re-running over a cache keeps already-set variables.
   local cfg bld
   if [[ -n $preset ]]; then
     add_task "configure" "" cmake --preset "$preset"
@@ -963,8 +952,7 @@ adopt_compdb() {
       BUILD_DIR=build/zide PRESET=""
       if [[ -L $ROOT/compile_commands.json ]]; then
         db=$(readlink -- "$ROOT/compile_commands.json")
-        # Only reuse a relative target: an absolute symlink points outside the
-        # tree and must not be rewritten into a $ROOT-relative build dir.
+        # Reuse only a relative target; an absolute symlink points outside the tree.
         if [[ $db != /* && $db == */* ]]; then BUILD_DIR=$(dirname -- "$db"); fi
       elif [[ -f $ROOT/CMakePresets.json ]] && have jq &&
         jq -e '.configurePresets[]? | select(.name=="dev")' -- "$ROOT/CMakePresets.json" >/dev/null 2>&1; then
@@ -1172,8 +1160,7 @@ cmd_adopt() {
   if (((DETECT_C || DETECT_CPP) && ${#BUILDS[@]} == 0 && !NO_CMAKE)); then
     info "no build system found; generating a CMakeLists.txt from the sources"
     adopt_generate_cmakelists
-    # The file list predates the generated CMakeLists.txt; rescan so target
-    # detection in adopt_zed sees it (otherwise run tasks guess a wrong name).
+    # The file list predates the generated CMakeLists.txt, so rescan before target detection.
     scan_files
     detect_builds
   fi
@@ -1355,8 +1342,7 @@ init_resolve() {
     ask s "Strict warnings -Wall -Wextra -Wpedantic -Werror? (y/n)" n
     case ${s,,} in y | yes) STRICT=1 ;; *) STRICT=0 ;; esac
   fi
-  # NOTE: a bare --std sets CXX_STD always and C_STD only when valid for C
-  # (see parse_args); validate only the language(s) actually used.
+  # A bare --std sets CXX_STD always and C_STD only when valid for C; validate only the languages used.
   case $LANG_SEL in
     c)
       if [[ -n $STD_BARE && ! $STD_BARE =~ ^(11|17|23)$ ]]; then
@@ -2380,8 +2366,7 @@ ui_banner() {
 ui_section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
 
 # ui_input <var> <question> <default>   (readline editing, Tab completes paths)
-# The default is shown as a hint; the edit buffer starts empty. Enter on an
-# empty buffer accepts the default; typed text replaces it entirely.
+# The default shows as a hint and the buffer starts empty; Enter accepts the default and typed text replaces it.
 ui_input() {
   local -n _ui_ref=$1
   local ans=""
@@ -2730,8 +2715,7 @@ parse_args() {
               c++*) CXX_STD=${v#*++} ;;
               c[0-9]*) C_STD=${v#[cC]} ;;
               *)
-                # Bare N is primarily the C++ standard; adopt it for C only
-                # when it is also a valid C standard (else the C default stays).
+                # A bare N is the C++ standard; use it for C only when valid for C.
                 STD_BARE=$v
                 CXX_STD=$v
                 case $v in 11 | 17 | 23) C_STD=$v ;; esac

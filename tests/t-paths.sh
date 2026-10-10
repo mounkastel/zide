@@ -3,9 +3,7 @@
 set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-# Quoted "~..." arguments below are intentional: the shell must pass zide a
-# literal tilde so zide's own expansion is what the test exercises
-# (each use carries its own SC2088 disable; see shellcheck quirk with -x).
+# Quoted "~..." args pass a literal tilde so zide's own expansion is exercised (each carries its own SC2088 disable).
 
 T=$(fresh_dir)
 track_tmp "$T"
@@ -122,8 +120,7 @@ else
   fi
 fi
 
-# 7. Wizard through a pty: hint display, empty buffer, Enter-accepts-default,
-#    and a typed ~/x that lands under the temporary HOME.
+# 7. Wizard through a pty: hint display, empty buffer, Enter-accepts-default, and a typed ~/x under the temporary HOME.
 if ! have_tool script; then
   if [[ -n ${ZIDE_REQUIRE_PTY:-} ]]; then
     tap_not_ok "wizard path prompt shows the default as a hint (script(1) missing but required)"
@@ -140,8 +137,7 @@ else
   OLD_HOME=$HOME
   export HOME=$H
   cmake_fixture "$T/wizdef"
-  # No path argument: the first prompt is the path (default "."); every
-  # answer is Enter, so the wizard adopts the current directory.
+  # No path argument, so every Enter accepts the default and the wizard adopts the current directory.
   if (cd "$T/wizdef" && printf '\n\n\n\n\n\n' | timeout 120 script -qec "$ZIDE -i adopt" /dev/null >"$T/wizdef.log" 2>&1); then
     tap_ok "wizard adopt exits 0"
   else
@@ -164,8 +160,7 @@ else
     tap_not_ok "wizard Enter accepts the default path"
   fi
   cmake_fixture "$H/x"
-  # Type a tilde path at the prompt: it must replace the default entirely
-  # (never append to it) and expand to the temporary HOME.
+  # A typed tilde path replaces the default entirely and expands to the temporary HOME.
   # shellcheck disable=SC2088
   if (cd "$W" && printf '~/x\n\n\n\n\n\n' | timeout 120 script -qec "$ZIDE -i adopt" /dev/null >"$T/wiztilde.log" 2>&1); then
     tap_ok "wizard typing ~/x exits 0"

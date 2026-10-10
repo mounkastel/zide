@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# --build/--build-system selects (and requires) the build system for adopt,
-# and must agree with --lang for init.
+# --build/--build-system selects the build system for adopt and must agree with --lang for init.
 set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
