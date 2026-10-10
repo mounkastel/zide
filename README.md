@@ -9,7 +9,7 @@ One Bash script that sets up Zed for C, C++ and Rust projects.
 ```sh
 git clone https://github.com/mounkastel/zide.git && cd zide
 make install   # installs to ~/.local/bin/zide
-zide --version # 3.1.0
+zide --version # prints the installed version
 ```
 
 Make sure `~/.local/bin` is on your `PATH`
@@ -38,9 +38,8 @@ zide init  <path>   scaffold a new project that builds, tests and runs immediate
 zide doctor         toolchain report with per-distro install hints (apt/dnf/pacman/zypper)
 ```
 
-Requirements: Bash 5+ (Bash 5.0 is covered by `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
-when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
-meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
+Requirements: Bash 5+ (Bash 5.0 is covered by `make test-compat`), Linux, GNU coreutils. Optional tools (`cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
+meson gdb lldb cargo rustc rust-analyzer`) fall back when missing. No network access is ever used.
 
 ## Quick start
 
@@ -107,8 +106,8 @@ unsafe operation, `130` interrupted. `doctor` exits `1` when a required tool
 * `.gitignore`: one managed block (`# >>> zide >>>`); your lines are untouched.
 * CMake projects: with `--configure`, configures (`dev` preset if present,
   else `build/zide`) and symlinks `compile_commands.json` to the root;
-  without it, no `compile_commands.json` is produced (re-run with
-  `--configure`, or configure the build yourself and re-run `adopt`).
+  without it, none is produced (re-run with `--configure`, or configure
+  the build yourself and re-run `adopt`).
   Your `CMakeLists.txt` is never modified. No build system at all: generates
   a reviewable `CMakeLists.txt` from the sources (`--no-cmake` to skip).
   Make: with `--configure`, `compiledb -n make`, or `bear -- make -B`
@@ -123,18 +122,11 @@ initial commit (unless `--no-git`). Rust: `Cargo.toml`, `src/{lib,main}.rs`,
 
 ## Safety guarantees
 
-* Existing files that differ from a template are kept, unless `--force` replaces them after saving a `*.bak.<UTC timestamp>` copy.
-* `.zed/settings.json` is merged with your keys winning, `tasks.json` and `debug.json` gain missing entries by `label`, and files with comments (JSONC) are left alone unless `--force` is passed.
-* `.gitignore` gains one managed block (`# >>> zide >>>`) while your lines stay untouched.
-* `--dry-run` prints every action with diffs and writes nothing, so re-running is a no-op.
-* Paths under `/`, `$HOME`, and system directories are refused, and generated JSON is checked with `jq` when it is installed.
-* A leading `~` or `~/...` in path arguments and wizard prompts expands to `$HOME`, `~user` forms stay literal, a bare `~` is refused like `$HOME`, and a `~` path with `HOME` unset fails instead of becoming relative.
-* Output is deterministic for the same flags when `--author` and `--year` are pinned.
-* `adopt` runs no project code unless `--configure` is passed, and the exact command is printed before it runs.
-* `--no-configure` on `adopt` means the same as the default and prints a one-line deprecation warning, while `init` still configures once on files zide generated.
-* Without `compile_commands.json`, clangd in Zed lacks accurate includes, defines, and jump-to-definition, so run `zide adopt --configure <path>` or configure the build and re-run `adopt`.
-* `--configure` executes the build system configure step, so project build files run.
-* Stdout carries data only (`zide doctor | grep` works) and all human output goes to stderr.
+* Existing files are kept unless `--force` is passed; replaced files get a `*.bak` backup.
+* `--dry-run` prints the plan with diffs and writes nothing.
+* `adopt` runs no project code unless `--configure` is passed.
+* Paths under `/`, `$HOME`, and system directories are refused.
+* Output is deterministic when `--author` and `--year` are pinned.
 
 ## Verify the Zed setup
 
@@ -160,7 +152,7 @@ make fmt    # shfmt -w on tests/ (needs shfmt; skips gracefully if absent)
 ./tests/run.sh   # same as make test
 ```
 
-Design background is in `docs/DESIGN.md`. Open items are tracked in the [issue tracker](https://github.com/mounkastel/zide/issues).
+Open items are tracked in the [issue tracker](https://github.com/mounkastel/zide/issues).
 
 ## License
 
