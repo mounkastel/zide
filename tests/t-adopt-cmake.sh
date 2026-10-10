@@ -58,7 +58,7 @@ if ! "$ZIDE" adopt "$T/preset" --no-configure >/dev/null 2>&1; then
   exit 1
 fi
 tap_ok "adopt preset project exits 0"
-if grep -q -- "--preset dev" "$T/preset/.zed/tasks.json"; then tap_ok "preset project gets preset-style tasks"; else tap_not_ok "preset project gets preset-style tasks"; fi
+if grep -qF -- '"--preset", "dev"' "$T/preset/.zed/tasks.json"; then tap_ok "preset project gets preset-style tasks"; else tap_not_ok "preset project gets preset-style tasks"; fi
 
 # An absolute compile_commands.json symlink must not confuse build-dir reuse.
 T2=$(fresh_dir)
