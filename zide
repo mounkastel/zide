@@ -2321,7 +2321,7 @@ adopt:
   --build B        drive only this build system: cmake | cargo
   --configure      run the build system to export compile_commands.json
                    (project code executes; the default is to run nothing)
-  --no-configure   deprecated for adopt: this is the default (kept working)
+  --no-configure   accepted for compatibility with scripts written against preview builds; equivalent to the default
   --no-cmake       never generate a CMakeLists.txt
   --std N          standard for a generated CMakeLists (C++ 17|20|23, C 11|17|23)
   --style S        clang-format base: llvm | mozilla | google

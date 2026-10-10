@@ -32,27 +32,13 @@ make uninstall PREFIX=/usr/local
 make uninstall DESTDIR=<stage> PREFIX=/usr/local  # packagers: staged removal
 ```
 
-## Migrating from 2.x
-
-3.0.0 no longer runs the build during `adopt`, so scripts (CI jobs included)
-that depend on `compile_commands.json` must add `--configure`:
-
-```sh
-# before
-zide adopt .
-# after
-zide adopt --configure .
-```
-
-See the [3.0.0 release notes](https://github.com/mounkastel/zide/releases/tag/v3.0.0).
-
 ```
 zide adopt <path>   retrofit an existing project (never breaks your build)
 zide init  <path>   scaffold a new project that builds, tests and runs immediately
 zide doctor         toolchain report with per-distro install hints (apt/dnf/pacman/zypper)
 ```
 
-Requirements: Bash 5+ (tested with 5.0 and 5.3 via `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
+Requirements: Bash 5+ (Bash 5.0 is covered by `make test-compat`), Linux, GNU coreutils. Optional tools (all degrade gracefully
 when missing): `cmake ninja clangd clang-format clang-tidy jq git bear|compiledb
 meson gdb lldb cargo rustc rust-analyzer`. No network access is ever used.
 
