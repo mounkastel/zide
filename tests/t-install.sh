@@ -16,10 +16,10 @@ tap_ok "make install PREFIX works"
 if [[ -x $T/pfx/bin/zide ]]; then tap_ok "installed binary is executable"; else tap_not_ok "installed binary is executable"; fi
 installed_ver=$("$T/pfx/bin/zide" --version)
 repo_ver=$("$REPO_ROOT/zide" --version)
-if [[ $installed_ver == "$repo_ver" ]] && printf '%s\n' "$installed_ver" | grep -q "1.3.0"; then
-  tap_ok "installed binary prints 1.3.0"
+if [[ $installed_ver == "$repo_ver" ]] && printf '%s\n' "$installed_ver" | grep -q "1.4.0"; then
+  tap_ok "installed binary prints 1.4.0"
 else
-  tap_not_ok "installed binary prints 1.3.0"
+  tap_not_ok "installed binary prints 1.4.0"
 fi
 
 # 2. DESTDIR staging with an absolute PREFIX never touches the real prefix.
