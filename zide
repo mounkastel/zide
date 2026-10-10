@@ -847,6 +847,65 @@ cargo_pkg_name() {
   awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name[[:space:]]*=/{gsub(/^[^"]*"|".*$/,""); print; exit}' "$ROOT/Cargo.toml"
 }
 
+# has_main <relpath>: 0 when the file defines main() outside comments.
+# Comment handling is a heuristic: // and /* */ are stripped, string and
+# character literals are skipped, then main() must start a line.
+has_main() {
+  awk -v sq="'" '
+    {
+      line = $0
+      out = ""
+      q = ""
+      i = 1
+      n = length(line)
+      while (i <= n) {
+        c = substr(line, i, 1)
+        two = substr(line, i, 2)
+        if (inblock) {
+          if (two == "*/") { inblock = 0; i += 2 } else { i++ }
+        } else if (q != "") {
+          out = out c
+          if (c == "\\") { out = out substr(line, i + 1, 1); i += 2 }
+          else { if (c == q) q = ""; i++ }
+        } else if (two == "/*") { inblock = 1; i += 2 }
+        else if (two == "//") { break }
+        else {
+          if (c == "\"" || c == sq) q = c
+          out = out c
+          i++
+        }
+      }
+      if (out ~ /^[[:space:]]*(int|void)[[:space:]]+main[[:space:]]*\(/) found = 1
+    }
+    END { exit !found }
+  ' "$ROOT/$1"
+}
+
+# entry_target <relpath> <ident> <used...>: unique target name on stdout.
+# Derived from the relative path (/ - . become _), extension dropped.
+entry_target() {
+  local rel=$1 ident=$2 base t n=2 m taken
+  shift 2
+  base=${rel%.*}
+  base=${base//\//_}
+  base=${base//-/_}
+  base=${base//./_}
+  base=$(make_ident "$base") || base=target
+  t=$base
+  while :; do
+    taken=0
+    if [[ $t == "$ident" || $t == "${ident}_core" ]]; then taken=1; fi
+    for m in "$@"; do
+      if [[ $m == "$t" ]]; then taken=1; break; fi
+    done
+    ((taken)) || break
+    t="${base}_${n}"
+    n=$((n + 1))
+  done
+  if [[ $t != "$base" ]]; then info "target for $rel named $t (avoids a name collision)"; fi
+  printf '%s' "$t"
+}
+
 # --------------------------------------------------------------------------
 # Mode 1: adopt
 # --------------------------------------------------------------------------
@@ -855,15 +914,15 @@ C_STD=17 CXX_STD=20
 BUILD_DIR="" PRESET="" DB_DIR="."
 
 adopt_generate_cmakelists() {
-  local name ident langs f body="" tgt inc n_main=0
-  local -a libs=() mains=() incs=() std=()
+  local name ident langs f body="" tgt inc
+  local -a libs=() mains=() incs=() std=() targets=()
   name=$(basename -- "$ROOT")
   ident=$(make_ident "$name") || ident=project
   for f in "${FILES[@]}"; do
     case $f in
       tests/* | test/* | */tests/* | */test/* | benchmarks/* | bench/* | */benchmarks/* | examples/* | */examples/* | docs/* | */docs/*) continue ;;
       *.c | *.cc | *.cpp | *.cxx)
-        if grep -qE '^[[:space:]]*(int|auto)[[:space:]]+main[[:space:]]*\(' "$ROOT/$f"; then
+        if has_main "$f"; then
           mains+=("$f")
         else
           libs+=("$f")
@@ -875,7 +934,9 @@ adopt_generate_cmakelists() {
     warn "no translation units found; not generating CMakeLists.txt"
     return 0
   fi
-  n_main=${#mains[@]}
+  if ((${#mains[@]})); then
+    mapfile -t mains < <(printf '%s\n' "${mains[@]}" | LC_ALL=C sort -u)
+  fi
   if ((DETECT_CPP)); then
     if ((DETECT_C)); then langs="C CXX"; else langs="CXX"; fi
   else
@@ -903,11 +964,8 @@ add_library(${ident}_core"$'\n'
     body+="target_include_directories(${ident}_core PUBLIC ${incs[*]})"$'\n'
   fi
   for f in "${mains[@]}"; do
-    if ((n_main == 1)); then
-      tgt=$ident
-    else
-      tgt="${ident}_$(make_ident "$(basename -- "${f%.*}")")"
-    fi
+    tgt=$(entry_target "$f" "$ident" "${targets[@]}")
+    targets+=("$tgt")
     body+=$'\n'"add_executable(${tgt} $f)"$'\n'
     if ((${#libs[@]})); then
       body+="target_link_libraries(${tgt} PRIVATE ${ident}_core)"$'\n'
@@ -916,6 +974,7 @@ add_library(${ident}_core"$'\n'
     fi
   done
   put_str "$ROOT/CMakeLists.txt" text 644 "$body"
+  info "CMake targets: ${#mains[@]} (one per file with main())"
 }
 
 # announce_run <cmd...>: one-line pre-execution notice (stderr) naming the exact
